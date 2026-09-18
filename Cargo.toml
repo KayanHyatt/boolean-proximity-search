@@ -1,0 +1,40 @@
+[package]
+name = "boolsearch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A Boolean + proximity search engine with a positional inverted index"
+repository = "https://github.com/KayanHyatt/boolean-proximity-search"
+license = "MIT"
+readme = "README.md"
+keywords = ["search", "inverted-index", "boolean", "proximity", "text"]
+categories = ["text-processing"]
+publish = false
+
+[lib]
+name = "boolsearch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "boolsearch"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+thiserror = "2.0"
+
+# Lints live in the manifest rather than as crate-level attributes so that
+# `cargo build`, `cargo clippy` and CI all agree without anyone remembering a
+# flag.
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = "deny"
+
+# Keep debug info in release builds: every benchmark from day 12 onwards wants
+# symbols for `perf` / flamegraphs, and this costs binary size, not speed.
+[profile.release]
+debug = true

@@ -1,5 +1,7 @@
 # Boolean + Proximity Search Engine
 
+[![CI](https://github.com/KayanHyatt/boolean-proximity-search/actions/workflows/ci.yml/badge.svg)](https://github.com/KayanHyatt/boolean-proximity-search/actions/workflows/ci.yml)
+
 A search engine in Rust over a large text corpus, built around a **positional
 inverted index** and a **real query language** — not a `grep` wrapper.
 
@@ -50,6 +52,8 @@ on the full set.
 Precedence, tightest first: `NOT` → `NEAR` → `AND` → `OR`.
 
 ## Build
+
+Requires Rust 1.85 or newer (edition 2024).
 
 ```bash
 cargo build --release

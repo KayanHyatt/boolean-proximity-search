@@ -1,0 +1,6 @@
+# Normalise line endings so CI (Linux) and a Windows checkout agree, which
+# keeps `cargo fmt --check` honest.
+* text=auto eol=lf
+
+*.png binary
+*.bin binary

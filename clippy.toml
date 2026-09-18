@@ -1,0 +1,6 @@
+# Clippy reads the MSRV from `rust-version` in Cargo.toml; this file is only
+# for threshold and vocabulary tweaks.
+too-many-arguments-threshold = 6
+
+# Identifiers Clippy should not nag about in doc comments.
+doc-valid-idents = ["arXiv", "JSONL", "BM25", ".."]
