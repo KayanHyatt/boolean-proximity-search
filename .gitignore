@@ -1,0 +1,24 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Index artifacts and corpora — never commit these
+/data/
+*.bin
+*.idx
+arxiv*.json
+arxiv*.jsonl
+*.jsonl
+!tests/data/*.jsonl
+
+# Benchmark output
+/criterion/
+/bench-results/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
