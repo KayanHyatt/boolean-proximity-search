@@ -61,3 +61,24 @@ throughput rather than 58%.
 The general shape of this, worth remembering: when an optimization gets you
 19% and you wanted 100%, the problem is usually the work itself, not how you
 are doing it.
+
+### Day 2 — the real corpus, on real hardware
+
+Everything above is a synthetic corpus in a Linux container. This is the actual
+arXiv metadata dump — **2,710,806 records, 4.3 GiB** — on the development
+machine (Windows, Rust 1.98.1, `--release`):
+
+| | Elapsed | Throughput |
+| --- | --- | --- |
+| Before the normalization fix | 14.83 s | 183k docs/s · 297 MiB/s |
+| After | **6.76 s** | **401k docs/s · 652 MiB/s** |
+
+2.2x, and the ratio matches the container's almost exactly, which is a small
+piece of evidence that the measurement is about the code rather than about one
+machine's disk.
+
+For scale: 2.6 GiB of indexable text — titles and abstracts — read, parsed and
+catalogued in under seven seconds. Day 12 compares query latency against a
+naive linear scan over this same corpus, and *that* scan is what this number
+has to be set against: seven seconds is the cost of touching every document
+once, which a linear scan pays on **every query**.
