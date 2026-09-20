@@ -177,7 +177,8 @@ fn index_corpus(input: &Path, output: &Path, limit: Option<usize>) -> Result<()>
     if let Some((id, meta)) = store.iter().next() {
         println!(
             "  first document: {id} {} — {}",
-            meta.external_id, meta.title
+            meta.external_id,
+            truncate(&meta.title, 72)
         );
     }
     println!(
@@ -186,6 +187,21 @@ fn index_corpus(input: &Path, output: &Path, limit: Option<usize>) -> Result<()>
     );
 
     Ok(())
+}
+
+/// Shortens `text` to at most `limit` characters, adding an ellipsis.
+///
+/// Counts characters rather than bytes: slicing a `String` by byte index panics
+/// if the cut lands inside a multi-byte character, and arXiv titles include
+/// accented Latin, Greek and CJK.
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+
+    let mut shortened: String = text.chars().take(limit.saturating_sub(1)).collect();
+    shortened.push('\u{2026}');
+    shortened
 }
 
 /// A per-second rate, guarding against a zero-length measurement.
@@ -326,6 +342,18 @@ mod tests {
         let error = super::run(&cli.command).expect_err("the corpus does not exist");
 
         assert!(error.to_string().contains("no-such-corpus.jsonl"));
+    }
+
+    #[test]
+    fn truncation_counts_characters_not_bytes() {
+        assert_eq!(super::truncate("short", 10), "short");
+        assert_eq!(super::truncate("exactly-10", 10), "exactly-10");
+        assert_eq!(super::truncate("truncate me", 8), "truncat\u{2026}");
+
+        // Multi-byte characters: slicing by byte index here would panic.
+        let japanese = "量子誤り訂正符号の構成について";
+        assert_eq!(super::truncate(japanese, 5), "量子誤り\u{2026}");
+        assert_eq!(super::truncate(japanese, 100), japanese);
     }
 
     #[test]

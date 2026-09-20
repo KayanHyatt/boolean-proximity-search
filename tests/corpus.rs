@@ -59,7 +59,7 @@ fn the_fields_the_engine_ignores_do_not_break_parsing() {
 
     assert_eq!(
         documents[0].title,
-        "Calculation of prompt diphoton production cross sections"
+        "Calculation of prompt diphoton production cross sections at Tevatron and LHC energies"
     );
     assert!(
         documents[0]
@@ -69,21 +69,48 @@ fn the_fields_the_engine_ignores_do_not_break_parsing() {
 }
 
 #[test]
-fn abstracts_are_trimmed_of_the_padding_arxiv_adds() {
+fn no_document_keeps_the_typesetting_whitespace_arxiv_stores() {
+    // The real dump pads abstracts with leading spaces and hard-wraps both
+    // titles and abstracts at roughly eighty columns. None of that should
+    // survive into a Document.
     let documents = load("tiny.jsonl");
 
     for document in &documents {
-        assert!(
-            !document.body.starts_with(char::is_whitespace),
-            "{} still has leading whitespace",
-            document.external_id
-        );
-        assert!(
-            !document.body.ends_with(char::is_whitespace),
-            "{} still has trailing whitespace",
-            document.external_id
-        );
+        for (field, text) in [("title", &document.title), ("body", &document.body)] {
+            assert!(
+                !text.starts_with(char::is_whitespace) && !text.ends_with(char::is_whitespace),
+                "{} {field} has whitespace at an end: {text:?}",
+                document.external_id
+            );
+            assert!(
+                !text.contains('\n') && !text.contains('\r') && !text.contains('\t'),
+                "{} {field} still contains a line break: {text:?}",
+                document.external_id
+            );
+            assert!(
+                !text.contains("  "),
+                "{} {field} still contains a double space: {text:?}",
+                document.external_id
+            );
+        }
     }
+}
+
+#[test]
+fn a_hard_wrapped_title_is_rejoined_into_one_line() {
+    // Fixture record 0704.0001 is stored exactly as the real dump stores it,
+    // with the title broken across two lines.
+    let documents = load("tiny.jsonl");
+
+    assert_eq!(
+        documents[0].title,
+        "Calculation of prompt diphoton production cross sections at Tevatron and LHC energies"
+    );
+    assert_eq!(
+        documents[0].body,
+        "A fully differential calculation in perturbative quantum chromodynamics is \
+         presented for the production of photon pairs at hadron colliders."
+    );
 }
 
 #[test]

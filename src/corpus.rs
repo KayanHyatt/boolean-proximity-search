@@ -231,14 +231,36 @@ impl<R: BufRead> Iterator for JsonlCorpus<R> {
             return Some(Ok(Document {
                 id,
                 external_id: record.id,
-                // arXiv abstracts are stored with leading whitespace and hard
-                // line wrapping; trimming here keeps positions from starting
-                // at a space on day 3.
-                title: record.title.trim().to_owned(),
-                body: record.body.trim().to_owned(),
+                title: normalize_whitespace(&record.title),
+                body: normalize_whitespace(&record.body),
             }));
         }
     }
+}
+
+/// Collapses every run of whitespace to a single space and trims the ends.
+///
+/// The arXiv dump stores text as it was typeset: abstracts are padded with
+/// leading spaces and both titles and abstracts are hard-wrapped, so a title
+/// arrives as `"Calculation of prompt diphoton production\n  cross sections"`.
+/// A newline in the middle of a title is not a tokenization problem — any
+/// whitespace separates tokens — but it is a display problem, and it means two
+/// documents whose titles differ only in where the typesetter broke the line
+/// would not compare equal.
+///
+/// Builds the result in one allocation rather than `split_whitespace().collect::<Vec<_>>().join(" ")`,
+/// which allocates a `Vec` of slices first and throws it away.
+fn normalize_whitespace(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+
+    for word in text.split_whitespace() {
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.push_str(word);
+    }
+
+    normalized
 }
 
 /// Everything a search result needs in order to name a document, indexed by
@@ -391,6 +413,43 @@ mod tests {
         // The real arXiv dump pads abstracts with leading spaces and newlines.
         let documents = read_all(SAMPLE);
         assert_eq!(documents[0].body, "A calculation.");
+    }
+
+    #[test]
+    fn hard_wrapped_text_is_unwrapped() {
+        // The real dump stores text as it was typeset, so a title arrives
+        // broken across lines. Found by running against the actual 4.3 GB file.
+        let input = concat!(
+            r#"{"id":"0704.0001","title":"Calculation of prompt diphoton production\n  cross sections","abstract":"  A fully differential calculation\nis presented.\n"}"#,
+            "\n",
+        );
+
+        let documents = read_all(input);
+
+        assert_eq!(
+            documents[0].title,
+            "Calculation of prompt diphoton production cross sections"
+        );
+        assert_eq!(
+            documents[0].body,
+            "A fully differential calculation is presented."
+        );
+    }
+
+    #[test]
+    fn whitespace_normalization_handles_every_kind_of_gap() {
+        assert_eq!(super::normalize_whitespace(""), "");
+        assert_eq!(super::normalize_whitespace("   "), "");
+        assert_eq!(super::normalize_whitespace("one"), "one");
+        assert_eq!(super::normalize_whitespace("  one  "), "one");
+        assert_eq!(super::normalize_whitespace("one\ntwo"), "one two");
+        assert_eq!(super::normalize_whitespace("one \t\r\n two"), "one two");
+        assert_eq!(
+            super::normalize_whitespace("one   two    three"),
+            "one two three"
+        );
+        // Non-breaking space is whitespace to Rust, and should collapse too.
+        assert_eq!(super::normalize_whitespace("one\u{a0}two"), "one two");
     }
 
     #[test]
