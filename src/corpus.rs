@@ -96,9 +96,19 @@ pub struct Document {
     pub id: DocId,
     /// The corpus's own identifier, e.g. the arXiv id `0704.0001`.
     pub external_id: String,
-    /// The document's title.
+    /// The document's title, with typesetting whitespace normalized away.
     pub title: String,
-    /// The body text. For arXiv, the abstract.
+    /// The body text — for arXiv, the abstract — trimmed but **not** unwrapped.
+    ///
+    /// The title is normalized and the body is not, which is deliberate.
+    /// Normalization exists for display and comparison, and the title is the
+    /// part that gets displayed. The body is only ever fed to the tokenizer,
+    /// which treats every kind of whitespace alike, so a newline in the middle
+    /// of it changes nothing. Normalizing it anyway would mean scanning every
+    /// byte of a 2.6 GiB corpus to reformat text that nobody reads — measured
+    /// at 2.2x the cost of the whole ingest. When day 13 starts showing
+    /// snippets, it can call [`normalize_whitespace`] on the few hundred
+    /// characters it is about to print.
     pub body: String,
 }
 
@@ -232,34 +242,63 @@ impl<R: BufRead> Iterator for JsonlCorpus<R> {
                 id,
                 external_id: record.id,
                 title: normalize_whitespace(&record.title),
-                body: normalize_whitespace(&record.body),
+                body: record.body.trim().to_owned(),
             }));
         }
     }
 }
 
-/// Collapses every run of whitespace to a single space and trims the ends.
+/// Collapses runs of ASCII whitespace to single spaces and trims the ends.
 ///
-/// The arXiv dump stores text as it was typeset: abstracts are padded with
-/// leading spaces and both titles and abstracts are hard-wrapped, so a title
-/// arrives as `"Calculation of prompt diphoton production\n  cross sections"`.
-/// A newline in the middle of a title is not a tokenization problem — any
-/// whitespace separates tokens — but it is a display problem, and it means two
-/// documents whose titles differ only in where the typesetter broke the line
-/// would not compare equal.
+/// The arXiv dump stores text as it was typeset: abstracts padded with leading
+/// spaces, and titles hard-wrapped, so one arrives as
+/// `"Calculation of prompt diphoton production\n  cross sections"`. A newline
+/// inside a title is not a tokenization problem — any whitespace separates
+/// tokens — but it is a display problem, and two titles differing only in
+/// where the typesetter broke the line would not compare equal.
 ///
-/// Builds the result in one allocation rather than `split_whitespace().collect::<Vec<_>>().join(" ")`,
-/// which allocates a `Vec` of slices first and throws it away.
-fn normalize_whitespace(text: &str) -> String {
-    let mut normalized = String::with_capacity(text.len());
+/// Only ASCII whitespace is collapsed. Typesetting artifacts are ASCII by
+/// construction, and deciding whether a non-breaking space separates two words
+/// is the tokenizer's job, not this function's.
+///
+/// Copies in spans rather than word by word. The obvious version —
+/// `text.split_whitespace().collect::<Vec<_>>().join(" ")`, or pushing each
+/// word in turn — breaks the copy at every single space, turning one memcpy per
+/// sentence into one per word.
+#[must_use]
+pub fn normalize_whitespace(text: &str) -> String {
+    let trimmed = text.trim();
+    let bytes = trimmed.as_bytes();
 
-    for word in text.split_whitespace() {
-        if !normalized.is_empty() {
-            normalized.push(' ');
+    let mut normalized = String::with_capacity(trimmed.len());
+    let mut copied = 0;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
         }
-        normalized.push_str(word);
+
+        let run_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+
+        // A single plain space is already what we want, so keep scanning and
+        // let it be copied as part of the next span. Breaking the copy here is
+        // what made the obvious word-by-word version slow: most gaps are
+        // single spaces, so it split every sentence into per-word memcpys.
+        if index - run_start == 1 && bytes[run_start] == b' ' {
+            continue;
+        }
+
+        normalized.push_str(&trimmed[copied..run_start]);
+        normalized.push(' ');
+        copied = index;
     }
 
+    normalized.push_str(&trimmed[copied..]);
     normalized
 }
 
@@ -430,9 +469,11 @@ mod tests {
             documents[0].title,
             "Calculation of prompt diphoton production cross sections"
         );
+        // The body is trimmed but deliberately not unwrapped — see the
+        // `Document::body` documentation for why.
         assert_eq!(
             documents[0].body,
-            "A fully differential calculation is presented."
+            "A fully differential calculation\nis presented."
         );
     }
 
@@ -448,8 +489,19 @@ mod tests {
             super::normalize_whitespace("one   two    three"),
             "one two three"
         );
-        // Non-breaking space is whitespace to Rust, and should collapse too.
-        assert_eq!(super::normalize_whitespace("one\u{a0}two"), "one two");
+        assert_eq!(super::normalize_whitespace("a b c d e"), "a b c d e");
+        assert_eq!(
+            super::normalize_whitespace("\n\nlead and trail\n\n"),
+            "lead and trail"
+        );
+
+        // Only ASCII whitespace is collapsed. A non-breaking space is left for
+        // the tokenizer to rule on; `trim` still removes it from the ends.
+        assert_eq!(super::normalize_whitespace("one\u{a0}two"), "one\u{a0}two");
+
+        // Multi-byte characters must survive a span copy intact.
+        assert_eq!(super::normalize_whitespace("量子\n誤り"), "量子 誤り");
+        assert_eq!(super::normalize_whitespace("naïve  Bayes"), "naïve Bayes");
     }
 
     #[test]

@@ -69,31 +69,52 @@ fn the_fields_the_engine_ignores_do_not_break_parsing() {
 }
 
 #[test]
-fn no_document_keeps_the_typesetting_whitespace_arxiv_stores() {
-    // The real dump pads abstracts with leading spaces and hard-wraps both
-    // titles and abstracts at roughly eighty columns. None of that should
-    // survive into a Document.
+fn no_title_keeps_the_typesetting_whitespace_arxiv_stores() {
+    // The real dump hard-wraps titles at roughly eighty columns. None of that
+    // should survive into a Document's title.
     let documents = load("tiny.jsonl");
 
     for document in &documents {
-        for (field, text) in [("title", &document.title), ("body", &document.body)] {
-            assert!(
-                !text.starts_with(char::is_whitespace) && !text.ends_with(char::is_whitespace),
-                "{} {field} has whitespace at an end: {text:?}",
-                document.external_id
-            );
-            assert!(
-                !text.contains('\n') && !text.contains('\r') && !text.contains('\t'),
-                "{} {field} still contains a line break: {text:?}",
-                document.external_id
-            );
-            assert!(
-                !text.contains("  "),
-                "{} {field} still contains a double space: {text:?}",
-                document.external_id
-            );
-        }
+        let title = &document.title;
+        assert!(
+            !title.starts_with(char::is_whitespace) && !title.ends_with(char::is_whitespace),
+            "{} title has whitespace at an end: {title:?}",
+            document.external_id
+        );
+        assert!(
+            !title.contains('\n') && !title.contains('\r') && !title.contains('\t'),
+            "{} title still contains a line break: {title:?}",
+            document.external_id
+        );
+        assert!(
+            !title.contains("  "),
+            "{} title still contains a double space: {title:?}",
+            document.external_id
+        );
     }
+}
+
+#[test]
+fn bodies_are_trimmed_but_left_wrapped() {
+    // Deliberate: the body is only ever tokenized, and the tokenizer treats
+    // every kind of whitespace alike. Normalizing it would mean scanning the
+    // whole corpus to reformat text nobody reads.
+    let documents = load("tiny.jsonl");
+
+    for document in &documents {
+        assert!(
+            !document.body.starts_with(char::is_whitespace)
+                && !document.body.ends_with(char::is_whitespace),
+            "{} body has whitespace at an end: {:?}",
+            document.external_id,
+            document.body
+        );
+    }
+
+    assert!(
+        documents[0].body.contains('\n'),
+        "fixture record 0704.0001 should still carry its hard wrapping"
+    );
 }
 
 #[test]
@@ -108,7 +129,7 @@ fn a_hard_wrapped_title_is_rejoined_into_one_line() {
     );
     assert_eq!(
         documents[0].body,
-        "A fully differential calculation in perturbative quantum chromodynamics is \
+        "A fully differential calculation in perturbative quantum chromodynamics is\n\
          presented for the production of photon pairs at hadron colliders."
     );
 }
