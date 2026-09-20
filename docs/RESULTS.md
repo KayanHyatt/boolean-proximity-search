@@ -93,3 +93,25 @@ two integers, and `Token::normalized()` hands back that same slice unless
 lowercasing would actually change it. At 69M tokens, the naive
 `String`-per-token design would allocate 69 million times to produce bytes that
 already exist in memory.
+
+### Day 3 — the real corpus, on real hardware
+
+The actual arXiv dump, 2,710,806 records, on the development machine:
+
+| | Value |
+| --- | --- |
+| Tokens | **436,145,397** |
+| Elapsed (ingest + tokenize) | 17.22 s |
+| Rate | 157k docs/s · 25.3M tokens/s |
+| Ingest alone (day 2) | 6.76 s |
+
+So tokenization costs about 10.5 s on top of ingest — roughly 41M tokens/s for
+the tokenizing itself, faster than the synthetic measurement above because real
+abstracts are more ASCII and less awkward than the generated ones.
+
+**436 million tokens is the number day 4 has to design against.** Every token
+occurrence needs a position in the index. At a naive `u32` per position that is
+1.7 GB for positions alone, before a single document id or term string. Which
+is the whole argument for day 13's delta encoding and varint compression, and
+worth knowing now rather than discovering when the index builder runs out of
+memory.
