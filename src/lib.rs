@@ -30,5 +30,5 @@ pub mod query;
 pub mod search;
 pub mod tokenize;
 
-pub use crate::corpus::DocId;
+pub use crate::corpus::{DocId, DocMeta, DocStore, Document, JsonlCorpus};
 pub use crate::error::{Error, Result};

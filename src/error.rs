@@ -52,6 +52,30 @@ pub enum Error {
     #[error("invalid index: {0}")]
     IndexFormat(String),
 
+    /// A line in the corpus was not valid JSON, or was missing a field the
+    /// engine requires.
+    ///
+    /// Carries the line number so the offending record can actually be found
+    /// in a four-gigabyte file.
+    #[error("{}:{line}: malformed record", path.display())]
+    MalformedRecord {
+        /// The corpus file.
+        path: PathBuf,
+        /// One-based line number of the offending record.
+        line: usize,
+        /// What serde objected to.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// The corpus holds more documents than a [`DocId`](crate::DocId) can
+    /// address.
+    #[error(
+        "corpus exceeds {} documents, the most a u32 document id can address",
+        u32::MAX
+    )]
+    CorpusTooLarge,
+
     /// A feature that a later day of the build plan will fill in.
     ///
     /// Temporary scaffolding; it should be gone by day 14.
