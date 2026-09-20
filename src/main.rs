@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use boolsearch::{DocStore, JsonlCorpus, Result};
+use boolsearch::{DocStore, JsonlCorpus, Result, tokenize};
 use clap::{Parser, Subcommand};
 
 /// Boolean + proximity search over a text corpus.
@@ -131,6 +131,7 @@ fn index_corpus(input: &Path, output: &Path, limit: Option<usize>) -> Result<()>
     let mut store = DocStore::new();
     let mut malformed = 0usize;
     let mut text_bytes = 0usize;
+    let mut tokens = 0u64;
 
     // `by_ref` so the counters inside `corpus` survive the loop: a plain `for`
     // would move the iterator and take `bytes_read` with it.
@@ -156,6 +157,13 @@ fn index_corpus(input: &Path, output: &Path, limit: Option<usize>) -> Result<()>
 
     for document in documents {
         text_bytes += document.text_len();
+
+        // Day 4 feeds these into the index. Today it just counts them, which
+        // is enough to measure what tokenization costs before anything else
+        // is layered on top of it.
+        tokens += tokenize(&document.title).count() as u64;
+        tokens += tokenize(&document.body).count() as u64;
+
         store.push(&document);
     }
 
@@ -166,10 +174,15 @@ fn index_corpus(input: &Path, output: &Path, limit: Option<usize>) -> Result<()>
     println!("  bytes scanned:  {}", format_bytes(corpus.bytes_read()));
     println!("  indexable text: {}", format_bytes(text_bytes as u64));
     println!("  elapsed:        {}", format_duration(elapsed));
+    println!("  tokens:         {}", format_count(tokens as f64));
     println!(
         "  throughput:     {} docs/s, {}/s",
         format_count(rate(documents as f64, elapsed)),
         format_bytes(rate(corpus.bytes_read() as f64, elapsed) as u64),
+    );
+    println!(
+        "                  {} tokens/s",
+        format_count(rate(tokens as f64, elapsed))
     );
     if malformed > 0 {
         println!("  malformed:      {malformed} record(s) skipped");

@@ -40,3 +40,6 @@ all = "deny"
 # symbols for `perf` / flamegraphs, and this costs binary size, not speed.
 [profile.release]
 debug = true
+
+[dev-dependencies]
+proptest = "1"

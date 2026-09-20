@@ -12,7 +12,7 @@
 //! ```
 //!
 //! [`corpus`] streams documents off disk and hands out dense [`DocId`]s.
-//! [`tokenize`] splits text into positioned terms. [`index`] inverts that into
+//! [`mod@tokenize`] splits text into positioned terms. [`index`] inverts that into
 //! a term → postings map, where a posting is a document plus every position the
 //! term occurs at — positions are what make phrase and proximity queries
 //! possible at all. [`query`] lexes and parses the query language into an AST,
@@ -32,3 +32,4 @@ pub mod tokenize;
 
 pub use crate::corpus::{DocId, DocMeta, DocStore, Document, JsonlCorpus, normalize_whitespace};
 pub use crate::error::{Error, Result};
+pub use crate::tokenize::{Token, Tokens, tokenize};

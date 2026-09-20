@@ -62,23 +62,34 @@ The general shape of this, worth remembering: when an optimization gets you
 19% and you wanted 100%, the problem is usually the work itself, not how you
 are doing it.
 
-### Day 2 — the real corpus, on real hardware
+## Day 3 — tokenization
 
-Everything above is a synthetic corpus in a Linux container. This is the actual
-arXiv metadata dump — **2,710,806 records, 4.3 GiB** — on the development
-machine (Windows, Rust 1.98.1, `--release`):
+687 MiB synthetic corpus, 500,000 hard-wrapped records, **69,093,279 tokens**.
+Tokenization is measured as the difference between an ingest-only run and one
+that also tokenizes every title and abstract.
 
-| | Elapsed | Throughput |
-| --- | --- | --- |
-| Before the normalization fix | 14.83 s | 183k docs/s · 297 MiB/s |
-| After | **6.76 s** | **401k docs/s · 652 MiB/s** |
+| | Total elapsed | Tokenizing alone | Rate |
+| --- | --- | --- | --- |
+| Ingest only (day 2) | 1.20 s | — | — |
+| \+ tokenize, character by character | 4.06 s | 2.86 s | 24.2M tokens/s |
+| **\+ tokenize, ASCII fast path** | **3.20 s** | **2.00 s** | **34.5M tokens/s** |
 
-2.2x, and the ratio matches the container's almost exactly, which is a small
-piece of evidence that the measurement is about the code rather than about one
-machine's disk.
+The fast path is the same rule written twice. Scanning a word with
+`char_indices()` decodes UTF-8 for every character; in ASCII text, a byte *is*
+a character, so that decoding is pure overhead. The byte loop handles ASCII and
+hands the whole word to the character-aware version the moment a non-ASCII byte
+appears — wasteful for that word, and irrelevant, because almost no word takes
+that path.
 
-For scale: 2.6 GiB of indexable text — titles and abstracts — read, parsed and
-catalogued in under seven seconds. Day 12 compares query latency against a
-naive linear scan over this same corpus, and *that* scan is what this number
-has to be set against: seven seconds is the cost of touching every document
-once, which a linear scan pays on **every query**.
+Note the contrast with day 2, where two rounds of exactly this kind of cleverness
+bought 19% and the real answer was to delete the work. Here the work is not
+optional — the tokens are the product — so making the scan cheaper is the only
+lever, and it pays.
+
+### Allocations
+
+Zero per token. A `Token<'a>` is a `&'a str` into the document's own text plus
+two integers, and `Token::normalized()` hands back that same slice unless
+lowercasing would actually change it. At 69M tokens, the naive
+`String`-per-token design would allocate 69 million times to produce bytes that
+already exist in memory.
