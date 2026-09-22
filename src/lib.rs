@@ -25,6 +25,7 @@
 
 pub mod corpus;
 pub mod error;
+pub mod format;
 pub mod index;
 pub mod query;
 pub mod search;
@@ -32,6 +33,7 @@ pub mod tokenize;
 
 pub use crate::corpus::{DocId, DocMeta, DocStore, Document, JsonlCorpus, normalize_whitespace};
 pub use crate::error::{Error, Result};
+pub use crate::format::SearchIndex;
 pub use crate::index::{
     FIELD_GAP, Index, IndexAssembler, IndexBuilder, IndexStats, Posting, Postings, TermId,
 };

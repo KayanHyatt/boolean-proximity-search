@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use boolsearch::{DocStore, Document, IndexBuilder, JsonlCorpus, Result};
+use boolsearch::{DocStore, Document, IndexBuilder, JsonlCorpus, Result, SearchIndex, tokenize};
 use clap::{Parser, Subcommand};
 
 /// Boolean + proximity search over a text corpus.
@@ -95,13 +95,7 @@ fn run(command: &Command) -> Result<()> {
             query,
             index,
             limit,
-        } => {
-            println!("search");
-            println!("  query:  {query}");
-            println!("  index:  {}", index.display());
-            println!("  hits:   up to {limit}");
-            println!("  -> days 6-11 of docs/PLAN.md fill this in");
-        }
+        } => search_index(query, index, *limit)?,
 
         Command::Bench { index, queries } => {
             println!("bench");
@@ -257,7 +251,94 @@ fn index_corpus(input: &Path, output: &Path, limit: Option<usize>) -> Result<()>
         }
     }
 
-    println!("  -> day 5 writes this to {}", output.display());
+    let bundle = SearchIndex::new(index, store);
+    let writing = Instant::now();
+    bundle.save(output)?;
+    let written = writing.elapsed();
+
+    let on_disk = std::fs::metadata(output)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    println!(
+        "  written:      {} to {} in {}",
+        format_bytes(on_disk),
+        output.display(),
+        format_duration(written),
+    );
+
+    Ok(())
+}
+
+/// Loads an index and answers a single-term query.
+///
+/// Days 6 and 7 replace this with a lexer and a parser; until then this exists
+/// so the index can be looked at rather than only measured.
+fn search_index(query: &str, path: &Path, limit: usize) -> Result<()> {
+    let opening = Instant::now();
+    let bundle = SearchIndex::load(path)?;
+    let loaded = opening.elapsed();
+
+    let stats = bundle.index.stats();
+    println!(
+        "loaded {} terms over {} documents from {} in {}",
+        format_count(stats.terms as f64),
+        format_count(stats.documents as f64),
+        path.display(),
+        format_duration(loaded),
+    );
+
+    let terms: Vec<String> = tokenize(query)
+        .map(|token| token.normalized().into_owned())
+        .collect();
+
+    let [term] = terms.as_slice() else {
+        println!();
+        println!("  {query:?} is {} terms.", terms.len());
+        println!("  Only single-term lookup works so far — the query language");
+        println!("  arrives on days 6 and 7, and Boolean evaluation on day 8.");
+        return Ok(());
+    };
+
+    let started = Instant::now();
+    let found = bundle.index.postings_for(term);
+    let elapsed = started.elapsed();
+
+    println!();
+    let Some(postings) = found else {
+        println!("  {term:?} does not appear in the corpus.");
+        return Ok(());
+    };
+
+    let matches = postings.len();
+    println!(
+        "  {term:?} — {} documents ({:.2}% of the corpus), found in {:?}",
+        format_count(matches as f64),
+        100.0 * matches as f64 / stats.documents.max(1) as f64,
+        elapsed,
+    );
+    println!();
+
+    for posting in postings.take(limit) {
+        let meta = bundle.documents.get(posting.doc_id);
+        let title = meta.map_or("<unknown>", |meta| meta.title.as_str());
+        let external = meta.map_or("", |meta| meta.external_id.as_str());
+
+        println!("  {external:<12} {}", truncate(title, 62));
+        println!(
+            "  {:<12} {} occurrence(s) at {:?}",
+            "",
+            posting.frequency(),
+            &posting.positions[..posting.positions.len().min(8)],
+        );
+    }
+
+    if matches > limit {
+        println!();
+        println!(
+            "  ... {} more (raise --limit)",
+            format_count((matches - limit) as f64)
+        );
+    }
 
     Ok(())
 }
@@ -390,15 +471,37 @@ mod tests {
 
     #[test]
     fn the_stubbed_subcommands_still_succeed() {
-        let workloads = [
-            vec!["boolsearch", "search", "a AND b"],
-            vec!["boolsearch", "bench"],
-        ];
+        // `search` is no longer among them — it needs a real index file now.
+        let cli = Cli::parse_from(["boolsearch", "bench"]);
+        assert!(super::run(&cli.command).is_ok());
+    }
 
-        for argv in workloads {
-            let cli = Cli::parse_from(argv.iter().copied());
-            assert!(super::run(&cli.command).is_ok(), "{argv:?} failed");
-        }
+    #[test]
+    fn searching_without_an_index_names_the_missing_file() {
+        let cli = Cli::parse_from(["boolsearch", "search", "quantum", "-i", "no-such-index.bin"]);
+        let error = super::run(&cli.command).expect_err("there is no index");
+
+        assert!(
+            error.to_string().contains("no-such-index.bin"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn indexing_then_searching_finds_a_term() {
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tiny.jsonl");
+        let directory = std::env::temp_dir().join(format!("boolsearch-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("scratch");
+        let output = directory.join("index.bin");
+        let output = output.to_str().expect("utf-8 path");
+
+        let build = Cli::parse_from(["boolsearch", "index", "-i", fixture, "-o", output]);
+        assert!(super::run(&build.command).is_ok());
+
+        let query = Cli::parse_from(["boolsearch", "search", "quantum", "-i", output]);
+        assert!(super::run(&query.command).is_ok());
+
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]

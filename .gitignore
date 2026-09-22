@@ -6,6 +6,7 @@
 # Index artifacts and corpora — never commit these
 /data/
 *.bin
+/index.bin
 *.idx
 arxiv*.json
 arxiv*.jsonl

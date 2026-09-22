@@ -358,6 +358,16 @@ impl DocStore {
         });
     }
 
+    /// Every entry, in corpus order. Crate-private, for serialization.
+    pub(crate) fn entries(&self) -> &[DocMeta] {
+        &self.entries
+    }
+
+    /// Rebuilds a store from entries read off disk. Crate-private.
+    pub(crate) const fn from_entries(entries: Vec<DocMeta>) -> Self {
+        Self { entries }
+    }
+
     /// The metadata for `id`, or `None` if it was never indexed.
     #[must_use]
     pub fn get(&self, id: DocId) -> Option<&DocMeta> {

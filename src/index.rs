@@ -413,15 +413,46 @@ impl IndexAssembler {
 /// A finished positional inverted index.
 #[derive(Debug)]
 pub struct Index {
-    dictionary: FxHashMap<Box<str>, TermId>,
-    term_postings_start: Vec<u32>,
-    posting_docs: Vec<DocId>,
-    posting_positions_start: Vec<u32>,
-    positions: Vec<u32>,
-    documents: u32,
+    pub(crate) dictionary: FxHashMap<Box<str>, TermId>,
+    pub(crate) term_postings_start: Vec<u32>,
+    pub(crate) posting_docs: Vec<DocId>,
+    pub(crate) posting_positions_start: Vec<u32>,
+    pub(crate) positions: Vec<u32>,
+    pub(crate) documents: u32,
 }
 
 impl Index {
+    /// Reassembles an index from parts read off disk.
+    ///
+    /// Crate-private: the only caller is [`crate::format`], which has already
+    /// checked that the arrays are structurally consistent.
+    pub(crate) const fn from_parts(
+        dictionary: FxHashMap<Box<str>, TermId>,
+        term_postings_start: Vec<u32>,
+        posting_docs: Vec<DocId>,
+        posting_positions_start: Vec<u32>,
+        positions: Vec<u32>,
+        documents: u32,
+    ) -> Self {
+        Self {
+            dictionary,
+            term_postings_start,
+            posting_docs,
+            posting_positions_start,
+            positions,
+            documents,
+        }
+    }
+
+    /// How many term occurrences the index holds.
+    ///
+    /// Not `const`: `Vec::len` only became const-callable in Rust 1.87, and
+    /// this crate's floor is 1.85.
+    #[must_use]
+    pub fn positions_len(&self) -> usize {
+        self.positions.len()
+    }
+
     /// Looks a term up by its normalized text.
     ///
     /// The term must already be lowercased the way [`crate::Token::normalized`]
