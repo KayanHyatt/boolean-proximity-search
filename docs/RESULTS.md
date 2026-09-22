@@ -94,24 +94,62 @@ lowercasing would actually change it. At 69M tokens, the naive
 `String`-per-token design would allocate 69 million times to produce bytes that
 already exist in memory.
 
-### Day 3 — the real corpus, on real hardware
+## Day 4 — the positional inverted index
 
-The actual arXiv dump, 2,710,806 records, on the development machine:
+763 MiB synthetic corpus, 600,000 records, vocabulary shaped with a realistic
+long tail (a handful of very common words, a few hundred mid-frequency ones,
+and 400,000 rare terms).
 
-| | Value |
+| Documents | Terms | Postings | Positions | Index size | Build | Peak RSS |
+| --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | 398,891 | 6.8M | 15.5M | 124.6 MiB | 4.41 s | 162 MiB |
+| 600,000 | 400,051 | 41.0M | 93.0M | 680.9 MiB | 24.34 s | 802 MiB |
+
+### What the layout is worth
+
+The index is 681 MiB for 93M positions and 41M postings — **7.3 bytes per
+position**, all in. The shape the plan originally called for, a `Vec<Posting>`
+per term with a `Vec<u32>` inside each posting, would have spent 24 bytes of
+`Vec` header per posting before storing a single number: **984 MiB of headers
+alone**, on top of 372 MiB of positions, in 41 million separate heap
+allocations. Compressed sparse row replaces each of those headers with one
+4-byte offset, and the whole index is four allocations.
+
+Peak RSS is 802 MiB against a 681 MiB index — the two-pass build allocates each
+array exactly once, at exactly the right size, so there is no doubling from
+`Vec` growth and nothing to copy. That is the payoff for reading the corpus
+twice.
+
+### Build rate, and where it goes
+
+| Index size | Rate |
 | --- | --- |
-| Tokens | **436,145,397** |
-| Elapsed (ingest + tokenize) | 17.22 s |
-| Rate | 157k docs/s · 25.3M tokens/s |
-| Ingest alone (day 2) | 6.76 s |
+| 8.9 MiB | 4.71M positions/s |
+| 68.2 MiB | 3.87M positions/s |
+| 235.9 MiB | 3.56M positions/s |
+| 680.9 MiB | 3.71M positions/s |
 
-So tokenization costs about 10.5 s on top of ingest — roughly 41M tokens/s for
-the tokenizing itself, faster than the synthetic measurement above because real
-abstracts are more ASCII and less awkward than the generated ones.
+Day 3 tokenized at 25M tokens/s. Indexing runs at roughly 3.7M positions/s —
+about seven times slower — and each position is visited twice, once per pass.
+The extra work per token is a dictionary lookup and a write into a large array
+at an essentially random offset.
 
-**436 million tokens is the number day 4 has to design against.** Every token
-occurrence needs a position in the index. At a naive `u32` per position that is
-1.7 GB for positions alone, before a single document id or term string. Which
-is the whole argument for day 13's delta encoding and varint compression, and
-worth knowing now rather than discovering when the index builder runs out of
-memory.
+Swapping the standard library's default hasher for `rustc-hash`'s FxHash took
+the 600k build from 28.40 s to 24.34 s, a **14%** saving for a one-line change.
+The default is SipHash, chosen to resist hash-flooding attacks from untrusted
+input; an offline index build over a file already on disk is not exposed to
+that, so the protection is pure cost here.
+
+The remaining gap is not explained by index size alone: the rate falls only 21%
+across a 76-fold growth in the index, and flattens above ~200 MiB. So scattered
+writes cost something, but most of the seven-fold gap is simply the per-token
+dictionary lookup that tokenization does not have to do. Day 13 is where that
+gets attacked properly.
+
+### What this means for the real corpus
+
+436M positions at 7.3 bytes each is roughly **3.2 GB**, and at 3.7M
+positions/s roughly **two minutes** to build. So the full arXiv dump wants a
+machine with memory to spare; `--limit 500000` builds a representative index in
+about 25 seconds and 700 MiB. Making the full corpus comfortable is exactly
+what day 13's delta encoding and varint compression are for.

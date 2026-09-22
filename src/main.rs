@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use boolsearch::{DocStore, JsonlCorpus, Result, tokenize};
+use boolsearch::{DocStore, Document, IndexBuilder, JsonlCorpus, Result};
 use clap::{Parser, Subcommand};
 
 /// Boolean + proximity search over a text corpus.
@@ -121,33 +121,42 @@ fn run(command: &Command) -> Result<()> {
 /// should not produce four million lines of warnings.
 const MAX_REPORTED_MALFORMED: usize = 5;
 
-/// Streams the corpus, collecting document metadata and reporting throughput.
-///
-/// Days 4 and 5 add the actual index building; today this proves the corpus can
-/// be read at speed without loading it into memory.
-fn index_corpus(input: &Path, output: &Path, limit: Option<usize>) -> Result<()> {
-    let started = Instant::now();
-    let mut corpus = JsonlCorpus::open(input)?;
-    let mut store = DocStore::new();
-    let mut malformed = 0usize;
-    let mut text_bytes = 0usize;
-    let mut tokens = 0u64;
+/// What one pass over the corpus saw.
+struct PassSummary {
+    documents: usize,
+    bytes: u64,
+    malformed: usize,
+}
 
-    // `by_ref` so the counters inside `corpus` survive the loop: a plain `for`
-    // would move the iterator and take `bytes_read` with it.
-    //
-    // `filter_map` decides the policy for bad records (count, warn, skip) and
-    // `take` applies the limit to *documents*, not to lines, so `--limit 1000`
-    // means a thousand usable documents even in a corpus with holes in it.
-    let documents = corpus
+/// Streams the corpus once, handing each usable document to `visit`.
+///
+/// Both index passes go through here, so they see the same documents in the
+/// same order — which the two-pass build depends on absolutely.
+fn each_document<F>(
+    input: &Path,
+    limit: Option<usize>,
+    report_problems: bool,
+    mut visit: F,
+) -> Result<PassSummary>
+where
+    F: FnMut(&Document),
+{
+    let mut corpus = JsonlCorpus::open(input)?;
+    let mut malformed = 0usize;
+    let mut documents = 0usize;
+
+    // `by_ref` so the byte counter inside `corpus` survives the loop.
+    // `filter_map` decides the policy for bad records, and `take` applies the
+    // limit to *documents* rather than lines.
+    let usable = corpus
         .by_ref()
         .filter_map(|item| match item {
             Ok(document) => Some(document),
             Err(error) => {
                 malformed += 1;
-                if malformed <= MAX_REPORTED_MALFORMED {
+                if report_problems && malformed <= MAX_REPORTED_MALFORMED {
                     eprintln!("warning: {error}");
-                } else if malformed == MAX_REPORTED_MALFORMED + 1 {
+                } else if report_problems && malformed == MAX_REPORTED_MALFORMED + 1 {
                     eprintln!("warning: further malformed records will not be reported");
                 }
                 None
@@ -155,49 +164,100 @@ fn index_corpus(input: &Path, output: &Path, limit: Option<usize>) -> Result<()>
         })
         .take(limit.unwrap_or(usize::MAX));
 
-    for document in documents {
-        text_bytes += document.text_len();
-
-        // Day 4 feeds these into the index. Today it just counts them, which
-        // is enough to measure what tokenization costs before anything else
-        // is layered on top of it.
-        tokens += tokenize(&document.title).count() as u64;
-        tokens += tokenize(&document.body).count() as u64;
-
-        store.push(&document);
+    for document in usable {
+        visit(&document);
+        documents += 1;
     }
 
+    Ok(PassSummary {
+        documents,
+        bytes: corpus.bytes_read(),
+        malformed,
+    })
+}
+
+/// Builds a positional inverted index over the corpus and reports what it cost.
+///
+/// Day 5 writes the result to `output`; for now it is built, measured and
+/// dropped.
+fn index_corpus(input: &Path, output: &Path, limit: Option<usize>) -> Result<()> {
+    let started = Instant::now();
+
+    // Pass one: learn the vocabulary and how much room each term needs.
+    let mut builder = IndexBuilder::new();
+    let counting = each_document(input, limit, true, |document| {
+        builder.add_document(document);
+    })?;
+    let after_counting = started.elapsed();
+    let terms = builder.terms();
+
+    // The prefix sum between the passes: counts become starting offsets.
+    let mut assembler = builder.finish_counting()?;
+
+    // Pass two: write postings and positions into arrays that already fit.
+    let mut store = DocStore::with_capacity(counting.documents);
+    let filling = each_document(input, limit, false, |document| {
+        assembler.add_document(document);
+        store.push(document);
+    })?;
+
+    let index = assembler.finish()?;
     let elapsed = started.elapsed();
-    let documents = store.len();
+    let stats = index.stats();
 
-    println!("read {documents} documents from {}", input.display());
-    println!("  bytes scanned:  {}", format_bytes(corpus.bytes_read()));
-    println!("  indexable text: {}", format_bytes(text_bytes as u64));
-    println!("  elapsed:        {}", format_duration(elapsed));
-    println!("  tokens:         {}", format_count(tokens as f64));
     println!(
-        "  throughput:     {} docs/s, {}/s",
-        format_count(rate(documents as f64, elapsed)),
-        format_bytes(rate(corpus.bytes_read() as f64, elapsed) as u64),
+        "indexed {} documents from {}",
+        stats.documents,
+        input.display()
+    );
+    println!("  terms:        {}", format_count(stats.terms as f64));
+    println!("  postings:     {}", format_count(stats.postings as f64));
+    println!("  positions:    {}", format_count(stats.positions as f64));
+    println!("  index size:   {}", format_bytes(stats.bytes as u64));
+    println!(
+        "  vs corpus:    {:.1}% of {} scanned",
+        100.0 * stats.bytes as f64 / counting.bytes as f64,
+        format_bytes(counting.bytes),
     );
     println!(
-        "                  {} tokens/s",
-        format_count(rate(tokens as f64, elapsed))
+        "  build time:   {} ({} counting, {} filling)",
+        format_duration(elapsed),
+        format_duration(after_counting),
+        format_duration(elapsed - after_counting),
     );
-    if malformed > 0 {
-        println!("  malformed:      {malformed} record(s) skipped");
+    println!(
+        "  rate:         {} docs/s, {} positions/s",
+        format_count(rate(stats.documents as f64, elapsed)),
+        format_count(rate(stats.positions as f64, elapsed)),
+    );
+    if counting.malformed > 0 {
+        println!("  malformed:    {} record(s) skipped", counting.malformed);
     }
-    if let Some((id, meta)) = store.iter().next() {
-        println!(
-            "  first document: {id} {} — {}",
-            meta.external_id,
-            truncate(&meta.title, 72)
-        );
+
+    debug_assert_eq!(terms, stats.terms);
+    debug_assert_eq!(counting.documents, filling.documents);
+
+    // A concrete example, so the numbers above are not the only evidence the
+    // index actually holds anything.
+    if let Some(postings) = index.postings_for("quantum") {
+        let documents = postings.len();
+        if let Some(first) = index.postings_for("quantum").and_then(|mut p| p.next()) {
+            let title = store
+                .get(first.doc_id)
+                .map_or("", |meta| meta.title.as_str());
+            println!(
+                "  \"quantum\":    {} documents, first is {} at position(s) {:?}",
+                format_count(documents as f64),
+                first.doc_id,
+                &first.positions[..first.positions.len().min(4)],
+            );
+            if !title.is_empty() {
+                println!("                {}", truncate(title, 66));
+            }
+        }
     }
-    println!(
-        "  -> day 4 builds the index, day 5 writes {}",
-        output.display()
-    );
+
+    println!("  -> day 5 writes this to {}", output.display());
 
     Ok(())
 }

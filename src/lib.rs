@@ -32,4 +32,7 @@ pub mod tokenize;
 
 pub use crate::corpus::{DocId, DocMeta, DocStore, Document, JsonlCorpus, normalize_whitespace};
 pub use crate::error::{Error, Result};
+pub use crate::index::{
+    FIELD_GAP, Index, IndexAssembler, IndexBuilder, IndexStats, Posting, Postings, TermId,
+};
 pub use crate::tokenize::{Token, Tokens, tokenize};

@@ -76,6 +76,20 @@ pub enum Error {
     )]
     CorpusTooLarge,
 
+    /// The index needs more postings or positions than a `u32` offset can
+    /// address.
+    #[error("index exceeds {} postings or positions", u32::MAX)]
+    IndexTooLarge,
+
+    /// The corpus changed between the counting pass and the filling pass.
+    #[error(
+        "corpus changed between passes: {unexpected_terms} term occurrence(s) the counting pass never saw"
+    )]
+    CorpusChanged {
+        /// How many occurrences of unknown terms the filling pass met.
+        unexpected_terms: u64,
+    },
+
     /// A feature that a later day of the build plan will fill in.
     ///
     /// Temporary scaffolding; it should be gone by day 14.
