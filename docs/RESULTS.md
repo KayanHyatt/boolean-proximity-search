@@ -153,3 +153,46 @@ positions/s roughly **two minutes** to build. So the full arXiv dump wants a
 machine with memory to spare; `--limit 500000` builds a representative index in
 about 25 seconds and 700 MiB. Making the full corpus comfortable is exactly
 what day 13's delta encoding and varint compression are for.
+
+### Day 4 — the real corpus, on real hardware
+
+500,000 arXiv records on the development machine, against the 600,000-record
+synthetic corpus measured above:
+
+| | Synthetic (600k) | **Real arXiv (500k)** |
+| --- | --- | --- |
+| Terms | 400,051 | **291,917** |
+| Postings | 41.0M | **41.9M** |
+| Positions | 93.0M | **72.6M** |
+| Index size | 680.9 MiB | **605.8 MiB** |
+| Build time | 24.34 s | **14.81 s** |
+| Rate | 3.71M positions/s | **4.90M positions/s** |
+
+Real text indexes **32% faster per position** than the synthetic corpus, and
+the reason is the vocabulary. The generator invented 400,000 rare terms drawn
+uniformly, so almost every lookup missed cache. Real English has a bounded
+vocabulary with a steep frequency curve — 292,000 terms for 500,000 abstracts,
+and the common ones dominate — so the hot part of the dictionary stays
+resident. The synthetic corpus was harder than reality, which is the right
+direction for a benchmark to be wrong in.
+
+The other difference runs the other way: real documents repeat themselves less.
+41.9M postings over 72.6M positions is 1.73 occurrences per (term, document)
+pair, against the synthetic corpus's 2.27. More postings per position means
+more per-posting bookkeeping, so the real index costs **8.75 bytes per
+position** rather than 7.3.
+
+### Projection for the full corpus
+
+436M positions at 8.75 bytes is roughly **3.8 GB**, and at 33.8k documents/s
+roughly **80 seconds**. One million abstracts — the figure the project set out
+to beat sixty seconds on — lands at about **30 seconds**.
+
+### A hand-checkable sanity check
+
+The run reported that `quantum` first occurs in document #0 at position 118.
+Document #0 is the diphoton paper, whose title is twelve tokens long, so the
+body begins at 12 + `FIELD_GAP` = 112. Its abstract opens *"A fully
+differential calculation in perturbative quantum..."* — and `quantum` is the
+seventh body token, at 112 + 6 = **118**. The index can be checked by hand, on
+paper, against the corpus.
