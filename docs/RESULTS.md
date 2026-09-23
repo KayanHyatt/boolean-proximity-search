@@ -197,3 +197,24 @@ disk they go in lexicographic order with a parallel rank-to-`TermId` array.
   identical input. Sorting makes the same corpus produce byte-identical files —
   and `saving_is_deterministic` builds two indexes independently and asserts
   their bytes match.
+
+### Day 5 — the real corpus, on real hardware
+
+500,000 arXiv records on the development machine:
+
+| | Value |
+| --- | --- |
+| Build from corpus | 15.71 s |
+| Write to disk | 814 ms (791 MiB/s) |
+| File size | 644.1 MiB |
+| **Load from disk** | **358 ms** |
+| Term lookup | 800 ns |
+
+**44x**: 358 ms to load against 15.71 s to rebuild. The file is 644 MiB against
+a 605.8 MiB in-memory index estimate — the difference is the document store,
+which the file carries and `IndexStats::bytes` does not count.
+
+A real query against it, `quantum` over 500,000 abstracts: 56,630 matching
+documents located in 800 nanoseconds, because finding them is one hash lookup
+and two array offsets. The naive alternative — scanning 752 MiB of text — is
+what day 12 measures this against.
