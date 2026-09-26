@@ -40,11 +40,16 @@ pub enum Error {
     },
 
     /// A query could not be lexed or parsed.
+    ///
+    /// Carries a byte range rather than a single offset, so the offending text
+    /// can be underlined rather than merely pointed at.
     #[error("invalid query at byte {offset}: {message}")]
     Query {
-        /// Byte offset into the query string where parsing gave up.
+        /// Byte offset into the query string where the trouble starts.
         offset: usize,
-        /// What the parser found, and what it wanted instead.
+        /// How many bytes of the query the problem covers.
+        length: usize,
+        /// What was found, and what was wanted instead.
         message: String,
     },
 
@@ -143,6 +148,7 @@ mod tests {
     fn query_errors_point_at_an_offset() {
         let error = Error::Query {
             offset: 7,
+            length: 3,
             message: "expected a term after AND".to_owned(),
         };
 

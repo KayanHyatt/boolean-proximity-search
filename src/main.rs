@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use boolsearch::{DocStore, Document, IndexBuilder, JsonlCorpus, Result, SearchIndex, tokenize};
+use boolsearch::{
+    DocStore, Document, Error, IndexBuilder, JsonlCorpus, LexemeKind, Result, SearchIndex, lex,
+};
 use clap::{Parser, Subcommand};
 
 /// Boolean + proximity search over a text corpus.
@@ -73,6 +75,19 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
+
+            // A query error knows which characters caused it, so underline them
+            // rather than leaving the reader to count bytes.
+            if let (Error::Query { offset, length, .. }, Command::Search { query, .. }) =
+                (&error, &cli.command)
+            {
+                eprintln!();
+                for line in boolsearch::point_at(query, *offset, *length).lines() {
+                    eprintln!("  {line}");
+                }
+                eprintln!();
+            }
+
             let mut cause = error.source();
             while let Some(current) = cause {
                 eprintln!("  caused by: {current}");
@@ -274,6 +289,10 @@ fn index_corpus(input: &Path, output: &Path, limit: Option<usize>) -> Result<()>
 /// Days 6 and 7 replace this with a lexer and a parser; until then this exists
 /// so the index can be looked at rather than only measured.
 fn search_index(query: &str, path: &Path, limit: usize) -> Result<()> {
+    // Lex before loading. A syntax error should not cost a third of a second
+    // of disk read to discover, and nothing about lexing needs the index.
+    let lexemes = lex(query)?;
+
     let opening = Instant::now();
     let bundle = SearchIndex::load(path)?;
     let loaded = opening.elapsed();
@@ -287,15 +306,29 @@ fn search_index(query: &str, path: &Path, limit: usize) -> Result<()> {
         format_duration(loaded),
     );
 
-    let terms: Vec<String> = tokenize(query)
-        .map(|token| token.normalized().into_owned())
-        .collect();
-
-    let [term] = terms.as_slice() else {
+    let [only] = lexemes.as_slice() else {
         println!();
-        println!("  {query:?} is {} terms.", terms.len());
-        println!("  Only single-term lookup works so far — the query language");
-        println!("  arrives on days 6 and 7, and Boolean evaluation on day 8.");
+        println!("  lexed {} lexeme(s):", lexemes.len());
+        for lexeme in &lexemes {
+            println!(
+                "    {:<20} {:<24} bytes {}",
+                lexeme.to_string(),
+                lexeme.kind.describe(),
+                lexeme.span,
+            );
+        }
+        println!();
+        println!("  Day 7 parses these into a tree; day 8 evaluates it.");
+        return Ok(());
+    };
+
+    let LexemeKind::Term(term) = &only.kind else {
+        println!();
+        println!(
+            "  {} is {} — day 7 parses it, days 8 to 11 evaluate it.",
+            only,
+            only.kind.describe()
+        );
         return Ok(());
     };
 
@@ -474,6 +507,25 @@ mod tests {
         // `search` is no longer among them — it needs a real index file now.
         let cli = Cli::parse_from(["boolsearch", "bench"]);
         assert!(super::run(&cli.command).is_ok());
+    }
+
+    #[test]
+    fn a_malformed_query_is_refused_before_the_index_is_even_opened() {
+        // The index path does not exist, so if this fails with an io error
+        // rather than a query error, lexing is happening too late.
+        let cli = Cli::parse_from([
+            "boolsearch",
+            "search",
+            "quantum NEAR surface",
+            "-i",
+            "no-such-index.bin",
+        ]);
+        let error = super::run(&cli.command).expect_err("the query is malformed");
+
+        assert!(
+            matches!(error, boolsearch::Error::Query { .. }),
+            "got {error}"
+        );
     }
 
     #[test]

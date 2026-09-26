@@ -37,4 +37,5 @@ pub use crate::format::SearchIndex;
 pub use crate::index::{
     FIELD_GAP, Index, IndexAssembler, IndexBuilder, IndexStats, Posting, Postings, TermId,
 };
+pub use crate::query::{Lexeme, LexemeKind, Span, lex, point_at};
 pub use crate::tokenize::{Token, Tokens, tokenize};

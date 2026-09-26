@@ -198,23 +198,25 @@ disk they go in lexicographic order with a parallel rank-to-`TermId` array.
   and `saving_is_deterministic` builds two indexes independently and asserts
   their bytes match.
 
-### Day 5 — the real corpus, on real hardware
+## Day 6 — the query lexer
 
-500,000 arXiv records on the development machine:
+No throughput numbers worth reporting: lexing a query is microseconds against
+a 358 ms index load, and the query is a line of text rather than a corpus. What
+day 6 produces is a token stream with byte spans, and errors that can point.
 
-| | Value |
-| --- | --- |
-| Build from corpus | 15.71 s |
-| Write to disk | 814 ms (791 MiB/s) |
-| File size | 644.1 MiB |
-| **Load from disk** | **358 ms** |
-| Term lookup | 800 ns |
+```
+$ boolsearch search 'quantum NEAR surface'
+error: invalid query at byte 8: NEAR needs a distance, as in NEAR/3
 
-**44x**: 358 ms to load against 15.71 s to rebuild. The file is 644 MiB against
-a 605.8 MiB in-memory index estimate — the difference is the document store,
-which the file carries and `IndexStats::bytes` does not count.
+  quantum NEAR surface
+          ^^^^
+```
 
-A real query against it, `quantum` over 500,000 abstracts: 56,630 matching
-documents located in 800 nanoseconds, because finding them is one hash lookup
-and two array offsets. The naive alternative — scanning 752 MiB of text — is
-what day 12 measures this against.
+Every lexeme records the byte range it came from, which is what makes the
+caret possible. The caret counts *characters*, not bytes, so it still lines up
+under `naïve AND x` — a byte-counted caret would sit one column too far right.
+
+Lexing happens **before** the index is opened. A syntax error should not cost a
+third of a second of disk read to discover, and
+`a_malformed_query_is_refused_before_the_index_is_even_opened` points at a
+nonexistent index file to prove the ordering.
