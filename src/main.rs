@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use boolsearch::{
-    DocStore, Document, Error, IndexBuilder, JsonlCorpus, LexemeKind, Result, SearchIndex, lex,
+    DocStore, Document, Error, Expr, IndexBuilder, JsonlCorpus, Result, SearchIndex, parse,
 };
 use clap::{Parser, Subcommand};
 
@@ -289,9 +289,9 @@ fn index_corpus(input: &Path, output: &Path, limit: Option<usize>) -> Result<()>
 /// Days 6 and 7 replace this with a lexer and a parser; until then this exists
 /// so the index can be looked at rather than only measured.
 fn search_index(query: &str, path: &Path, limit: usize) -> Result<()> {
-    // Lex before loading. A syntax error should not cost a third of a second
-    // of disk read to discover, and nothing about lexing needs the index.
-    let lexemes = lex(query)?;
+    // Parse before loading. A syntax error should not cost a third of a
+    // second of disk read to discover, and parsing never needs the index.
+    let expression = parse(query)?;
 
     let opening = Instant::now();
     let bundle = SearchIndex::load(path)?;
@@ -306,29 +306,13 @@ fn search_index(query: &str, path: &Path, limit: usize) -> Result<()> {
         format_duration(loaded),
     );
 
-    let [only] = lexemes.as_slice() else {
+    let Expr::Term(term) = &expression else {
         println!();
-        println!("  lexed {} lexeme(s):", lexemes.len());
-        for lexeme in &lexemes {
-            println!(
-                "    {:<20} {:<24} bytes {}",
-                lexeme.to_string(),
-                lexeme.kind.describe(),
-                lexeme.span,
-            );
-        }
+        println!("  parsed, {} node(s):", expression.size());
         println!();
-        println!("  Day 7 parses these into a tree; day 8 evaluates it.");
-        return Ok(());
-    };
-
-    let LexemeKind::Term(term) = &only.kind else {
+        println!("    {expression}");
         println!();
-        println!(
-            "  {} is {} — day 7 parses it, days 8 to 11 evaluate it.",
-            only,
-            only.kind.describe()
-        );
+        println!("  Day 8 evaluates this tree.");
         return Ok(());
     };
 
@@ -507,6 +491,24 @@ mod tests {
         // `search` is no longer among them — it needs a real index file now.
         let cli = Cli::parse_from(["boolsearch", "bench"]);
         assert!(super::run(&cli.command).is_ok());
+    }
+
+    #[test]
+    fn a_query_that_lexes_but_does_not_parse_is_refused_too() {
+        // `quantum AND` is four valid lexemes and not a valid query.
+        let cli = Cli::parse_from([
+            "boolsearch",
+            "search",
+            "quantum AND",
+            "-i",
+            "no-such-index.bin",
+        ]);
+        let error = super::run(&cli.command).expect_err("the query is incomplete");
+
+        assert!(
+            matches!(error, boolsearch::Error::Query { .. }),
+            "got {error}"
+        );
     }
 
     #[test]

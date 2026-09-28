@@ -220,3 +220,50 @@ Lexing happens **before** the index is opened. A syntax error should not cost a
 third of a second of disk read to discover, and
 `a_malformed_query_is_refused_before_the_index_is_even_opened` points at a
 nonexistent index file to prove the ordering.
+
+## Day 7 — the parser
+
+No throughput to report: parsing a query is a walk over a handful of lexemes.
+What day 7 produces is a tree, and evidence that the tree is the right one.
+
+```
+$ boolsearch search "quantum AND ('error correction' NEAR/5 surface) NOT class*"
+
+  parsed, 7 node(s):
+
+    ((quantum AND ("error correction" NEAR/5 surface)) NOT class*)
+```
+
+### Precedence
+
+Loosest to tightest: `OR`, then `AND`/`NOT`, then `NEAR`, then terms and
+groups. So `a OR b AND c` parses as `(a OR (b AND c))`, the same way `+` is
+looser than `*`, and `a AND b NEAR/3 c` as `(a AND (b NEAR/3 c))` — proximity
+binds its operands before anything else can take them.
+
+The build plan listed `NOT` as the tightest operator. That is right for a
+*unary* `NOT`; this language has the binary difference `a NOT b`, so it belongs
+beside `AND`, where `a NOT b NOT c` reads left to right as it should. A unary
+`NOT classical` would mean "every document except those" — two and a half
+million results nobody asked for.
+
+### The Display impl is a test, not a convenience
+
+`Expr` prints fully parenthesized rather than prettily, which makes
+`parsing_is_idempotent` possible: print a tree, re-parse the printed form, and
+assert the two trees are equal. Eight queries go through that round trip. A
+precedence bug that happened to print plausibly would still fail it.
+
+### Errors still point
+
+```
+$ boolsearch search 'quantum AND'
+error: invalid query at byte 11: AND stops here, but something has to come after it
+
+  quantum AND
+             ^
+```
+
+Something *missing* gets a zero-width span at the end of the query; something
+*wrong* gets the span of the offending lexeme. Both survive multi-byte text,
+because the caret counts characters.

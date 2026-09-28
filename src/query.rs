@@ -426,6 +426,320 @@ pub fn point_at(query: &str, offset: usize, length: usize) -> String {
     format!("{query}\n{}{}", " ".repeat(leading), "^".repeat(width))
 }
 
+// ---------------------------------------------------------------------------
+// Day 7: the parser
+// ---------------------------------------------------------------------------
+
+/// A parsed query.
+///
+/// The recursion is why [`Box`] appears: an `Expr` containing an `Expr` by
+/// value would have no finite size, since the compiler would have to add up an
+/// infinite chain of them. Boxing puts the child on the heap and gives the
+/// parent a known size — the standard shape for a tree in Rust, and the reason
+/// day 8's evaluator is one `match` over seven cases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expr {
+    /// A single term.
+    Term(String),
+    /// Every term beginning with this stem.
+    Prefix(String),
+    /// Terms that must appear adjacent and in order.
+    Phrase(Vec<String>),
+    /// Two expressions occurring within `distance` positions of one another.
+    Near {
+        /// The left operand.
+        left: Box<Expr>,
+        /// The right operand.
+        right: Box<Expr>,
+        /// How many positions apart they may be, at most.
+        distance: u32,
+        /// Whether `left` must come first.
+        ordered: bool,
+    },
+    /// Both sides must match.
+    And(Box<Expr>, Box<Expr>),
+    /// Either side must match.
+    Or(Box<Expr>, Box<Expr>),
+    /// The left side must match and the right must not.
+    ///
+    /// Binary, never unary. `NOT classical` on its own would mean "every
+    /// document except those" — two and a half million results nobody asked
+    /// for. Requiring something on the left keeps the answer bounded by
+    /// something the user actually wanted.
+    Not(Box<Expr>, Box<Expr>),
+}
+
+impl fmt::Display for Expr {
+    /// Prints the tree fully parenthesized.
+    ///
+    /// Deliberately not "prettily": the point is that re-parsing the output
+    /// gives back the same tree, which makes the shape of a parse visible and
+    /// gives `parsing_is_idempotent` something exact to assert.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Term(term) => write!(f, "{term}"),
+            Self::Prefix(stem) => write!(f, "{stem}*"),
+            Self::Phrase(terms) => write!(f, "\"{}\"", terms.join(" ")),
+            Self::And(left, right) => write!(f, "({left} AND {right})"),
+            Self::Or(left, right) => write!(f, "({left} OR {right})"),
+            Self::Not(left, right) => write!(f, "({left} NOT {right})"),
+            Self::Near {
+                left,
+                right,
+                distance,
+                ordered,
+            } => {
+                let operator = if *ordered { "ONEAR" } else { "NEAR" };
+                write!(f, "({left} {operator}/{distance} {right})")
+            }
+        }
+    }
+}
+
+impl Expr {
+    /// Visits every node, parents before children.
+    pub fn walk(&self, visit: &mut impl FnMut(&Self)) {
+        visit(self);
+
+        match self {
+            Self::Term(_) | Self::Prefix(_) | Self::Phrase(_) => {}
+            Self::And(left, right) | Self::Or(left, right) | Self::Not(left, right) => {
+                left.walk(visit);
+                right.walk(visit);
+            }
+            Self::Near { left, right, .. } => {
+                left.walk(visit);
+                right.walk(visit);
+            }
+        }
+    }
+
+    /// How many nodes the tree holds.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        let mut count = 0;
+        self.walk(&mut |_| count += 1);
+        count
+    }
+}
+
+/// Parses a query into an [`Expr`].
+///
+/// # Precedence
+///
+/// Loosest to tightest: `OR`, then `AND`/`NOT`, then `NEAR`, then terms and
+/// parenthesized groups. So `a OR b AND c` is `a OR (b AND c)`, the same way
+/// `+` and `*` behave in arithmetic, and `a AND b NEAR/3 c` is
+/// `a AND (b NEAR/3 c)` — proximity binds its operands before anything else
+/// gets to them.
+///
+/// `AND` and `NOT` share a level and associate left, because `NOT` here is the
+/// binary difference `a NOT b` rather than a unary negation. The build plan
+/// listed `NOT` as the tightest operator, which is right for a unary `NOT`;
+/// with a binary one it belongs beside `AND`, and `a NOT b NOT c` reads
+/// left to right as it should.
+///
+/// Adjacent operands with no operator between them are an implicit `AND`, so
+/// `quantum error` finds documents containing both.
+///
+/// # Errors
+///
+/// Returns [`Error::Query`] with the byte range of the offending text, or a
+/// zero-width range at the end of the query when something is missing rather
+/// than wrong.
+pub fn parse(query: &str) -> Result<Expr> {
+    let lexemes = lex(query)?;
+    Parser {
+        lexemes: &lexemes,
+        position: 0,
+        end: query.len(),
+    }
+    .parse()
+}
+
+/// One function per precedence level, walking the lexemes left to right.
+struct Parser<'a> {
+    lexemes: &'a [Lexeme],
+    position: usize,
+    /// Byte length of the query, for pointing at "something is missing here".
+    end: usize,
+}
+
+impl Parser<'_> {
+    fn parse(&mut self) -> Result<Expr> {
+        if self.lexemes.is_empty() {
+            return Err(query_error(
+                Span::new(0, 0),
+                "the query is empty".to_owned(),
+            ));
+        }
+
+        let expression = self.parse_or("the query")?;
+
+        // Anything left over means the query did not hang together — most
+        // often a stray closing parenthesis.
+        if let Some(extra) = self.peek() {
+            let message = match &extra.kind {
+                LexemeKind::RightParen => {
+                    "this closing parenthesis has no opening one to match".to_owned()
+                }
+                kind => format!("{kind} was not expected here"),
+            };
+            return Err(query_error(extra.span, message));
+        }
+
+        Ok(expression)
+    }
+
+    /// `or := and ( OR and )*`
+    fn parse_or(&mut self, context: &str) -> Result<Expr> {
+        let mut left = self.parse_and(context)?;
+
+        while self.eat(&LexemeKind::Or) {
+            let right = self.parse_and("OR")?;
+            left = Expr::Or(Box::new(left), Box::new(right));
+        }
+
+        Ok(left)
+    }
+
+    /// `and := near ( (AND | NOT | nothing at all) near )*`
+    fn parse_and(&mut self, context: &str) -> Result<Expr> {
+        let mut left = self.parse_near(context)?;
+
+        loop {
+            if self.eat(&LexemeKind::And) {
+                let right = self.parse_near("AND")?;
+                left = Expr::And(Box::new(left), Box::new(right));
+            } else if self.eat(&LexemeKind::Not) {
+                let right = self.parse_near("NOT")?;
+                left = Expr::Not(Box::new(left), Box::new(right));
+            } else if self.at_operand() {
+                // Two operands side by side: an implicit AND, so that
+                // `quantum error` means what anyone would expect.
+                let right = self.parse_near(context)?;
+                left = Expr::And(Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
+        }
+
+        Ok(left)
+    }
+
+    /// `near := primary ( NEAR/k primary )*`
+    fn parse_near(&mut self, context: &str) -> Result<Expr> {
+        let mut left = self.parse_primary(context)?;
+
+        while let Some((distance, ordered)) = self.eat_near() {
+            let operator = if ordered { "ONEAR" } else { "NEAR" };
+            let right = self.parse_primary(operator)?;
+            left = Expr::Near {
+                left: Box::new(left),
+                right: Box::new(right),
+                distance,
+                ordered,
+            };
+        }
+
+        Ok(left)
+    }
+
+    /// `primary := term | prefix | phrase | ( or )`
+    fn parse_primary(&mut self, context: &str) -> Result<Expr> {
+        let Some(lexeme) = self.peek() else {
+            return Err(query_error(
+                Span::new(self.end, self.end),
+                format!("{context} stops here, but something has to come after it"),
+            ));
+        };
+
+        let span = lexeme.span;
+
+        match &lexeme.kind {
+            LexemeKind::Term(term) => {
+                let term = term.clone();
+                self.position += 1;
+                Ok(Expr::Term(term))
+            }
+            LexemeKind::Prefix(stem) => {
+                let stem = stem.clone();
+                self.position += 1;
+                Ok(Expr::Prefix(stem))
+            }
+            LexemeKind::Phrase(terms) => {
+                let terms = terms.clone();
+                self.position += 1;
+                Ok(Expr::Phrase(terms))
+            }
+            LexemeKind::LeftParen => {
+                self.position += 1;
+
+                if self.at(&LexemeKind::RightParen) {
+                    let close = self.peek().expect("just checked").span;
+                    return Err(query_error(
+                        Span::new(span.start, close.end),
+                        "this group is empty".to_owned(),
+                    ));
+                }
+
+                let inner = self.parse_or("this group")?;
+
+                if !self.eat(&LexemeKind::RightParen) {
+                    return Err(query_error(
+                        span,
+                        "this group is never closed — add a matching )".to_owned(),
+                    ));
+                }
+
+                Ok(inner)
+            }
+            kind => Err(query_error(
+                span,
+                format!("expected a term after {context}, found {}", kind.describe()),
+            )),
+        }
+    }
+
+    fn peek(&self) -> Option<&Lexeme> {
+        self.lexemes.get(self.position)
+    }
+
+    fn at(&self, kind: &LexemeKind) -> bool {
+        self.peek().is_some_and(|lexeme| &lexeme.kind == kind)
+    }
+
+    fn eat(&mut self, kind: &LexemeKind) -> bool {
+        if self.at(kind) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_near(&mut self) -> Option<(u32, bool)> {
+        let LexemeKind::Near { distance, ordered } = self.peek()?.kind else {
+            return None;
+        };
+        self.position += 1;
+        Some((distance, ordered))
+    }
+
+    /// Whether the next lexeme could begin an operand, which is what makes an
+    /// implicit `AND` an implicit `AND` rather than the end of the query.
+    fn at_operand(&self) -> bool {
+        matches!(
+            self.peek().map(|lexeme| &lexeme.kind),
+            Some(
+                LexemeKind::Term(_)
+                    | LexemeKind::Prefix(_)
+                    | LexemeKind::Phrase(_)
+                    | LexemeKind::LeftParen
+            )
+        )
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::{Lexeme, LexemeKind, Span, lex, point_at};
@@ -794,5 +1108,259 @@ mod tests {
         assert_eq!(span.len(), 5);
         assert!(!span.is_empty());
         assert!(Span::new(3, 3).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Day 7: the parser
+    // -----------------------------------------------------------------------
+
+    /// The parsed tree, printed fully parenthesized.
+    fn tree(query: &str) -> String {
+        super::parse(query).expect("query should parse").to_string()
+    }
+
+    /// The byte range a parse error points at.
+    fn parse_error_span(query: &str) -> (usize, usize) {
+        match super::parse(query).expect_err("query should be rejected") {
+            Error::Query { offset, length, .. } => (offset, length),
+            other => panic!("expected a query error, got {other}"),
+        }
+    }
+
+    fn parse_message(query: &str) -> String {
+        match super::parse(query).expect_err("query should be rejected") {
+            Error::Query { message, .. } => message,
+            other => panic!("expected a query error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn a_single_term_parses_to_itself() {
+        assert_eq!(tree("quantum"), "quantum");
+    }
+
+    #[test]
+    fn a_prefix_and_a_phrase_parse_to_themselves() {
+        assert_eq!(tree("comp*"), "comp*");
+        assert_eq!(tree("\"error correction\""), "\"error correction\"");
+    }
+
+    #[test]
+    fn and_binds_two_terms() {
+        assert_eq!(tree("a AND b"), "(a AND b)");
+    }
+
+    #[test]
+    fn adjacent_terms_are_an_implicit_and() {
+        assert_eq!(tree("quantum error"), "(quantum AND error)");
+        assert_eq!(tree("a b c"), "((a AND b) AND c)");
+    }
+
+    #[test]
+    fn or_binds_looser_than_and() {
+        // The case the build plan named: `a OR b AND c` must be `a OR (b AND c)`,
+        // the same way `+` is looser than `*`.
+        assert_eq!(tree("a OR b AND c"), "(a OR (b AND c))");
+        assert_eq!(tree("a AND b OR c"), "((a AND b) OR c)");
+    }
+
+    #[test]
+    fn near_binds_tighter_than_and() {
+        assert_eq!(tree("a AND b NEAR/3 c"), "(a AND (b NEAR/3 c))");
+        assert_eq!(tree("a NEAR/3 b AND c"), "((a NEAR/3 b) AND c)");
+    }
+
+    #[test]
+    fn near_binds_tighter_than_or_too() {
+        assert_eq!(tree("a OR b NEAR/2 c"), "(a OR (b NEAR/2 c))");
+    }
+
+    #[test]
+    fn ordered_near_is_a_distinct_operator() {
+        assert_eq!(tree("a ONEAR/4 b"), "(a ONEAR/4 b)");
+        assert_ne!(tree("a ONEAR/4 b"), tree("a NEAR/4 b"));
+    }
+
+    #[test]
+    fn not_is_binary_and_sits_with_and() {
+        assert_eq!(tree("a NOT b"), "(a NOT b)");
+        assert_eq!(tree("a AND b NOT c"), "((a AND b) NOT c)");
+        assert_eq!(tree("a NOT b AND c"), "((a NOT b) AND c)");
+    }
+
+    #[test]
+    fn operators_at_one_level_associate_left() {
+        assert_eq!(tree("a AND b AND c"), "((a AND b) AND c)");
+        assert_eq!(tree("a OR b OR c"), "((a OR b) OR c)");
+        assert_eq!(tree("a NOT b NOT c"), "((a NOT b) NOT c)");
+    }
+
+    #[test]
+    fn parentheses_override_precedence() {
+        assert_eq!(tree("(a OR b) AND c"), "((a OR b) AND c)");
+        assert_eq!(tree("a AND (b OR c)"), "(a AND (b OR c))");
+        assert_ne!(tree("(a OR b) AND c"), tree("a OR b AND c"));
+    }
+
+    #[test]
+    fn parentheses_nest() {
+        assert_eq!(tree("((a OR b) AND (c OR d))"), "((a OR b) AND (c OR d))");
+        assert_eq!(tree("(((a)))"), "a");
+    }
+
+    #[test]
+    fn a_group_can_be_a_near_operand() {
+        assert_eq!(
+            tree("(\"error correction\") NEAR/5 surface"),
+            "(\"error correction\" NEAR/5 surface)"
+        );
+    }
+
+    #[test]
+    fn a_phrase_can_be_a_near_operand_without_parentheses() {
+        // Day 10 has to make this work, so day 7 has to produce it.
+        assert_eq!(
+            tree("\"machine learning\" NEAR/5 medical"),
+            "(\"machine learning\" NEAR/5 medical)"
+        );
+    }
+
+    #[test]
+    fn the_worked_example_from_the_readme_parses() {
+        assert_eq!(
+            tree("quantum AND (\"error correction\" NEAR/5 surface) NOT class*"),
+            "((quantum AND (\"error correction\" NEAR/5 surface)) NOT class*)"
+        );
+    }
+
+    #[test]
+    fn an_implicit_and_mixes_with_explicit_operators() {
+        assert_eq!(tree("a b OR c"), "((a AND b) OR c)");
+        assert_eq!(tree("a OR b c"), "(a OR (b AND c))");
+    }
+
+    #[test]
+    fn a_hyphenated_word_parses_as_the_phrase_it_became() {
+        assert_eq!(tree("state-of-the-art"), "\"state of the art\"");
+    }
+
+    #[test]
+    fn parsing_is_idempotent() {
+        // Printing a tree and re-parsing it must give the same tree. This is
+        // what makes the Display impl trustworthy as evidence of a parse.
+        let queries = [
+            "quantum",
+            "a AND b",
+            "a OR b AND c",
+            "a NEAR/3 b AND c",
+            "(a OR b) AND (c NOT d)",
+            "quantum AND (\"error correction\" NEAR/5 surface) NOT class*",
+            "a b c d",
+            "a ONEAR/9 b OR c*",
+        ];
+
+        for query in queries {
+            let once = super::parse(query).expect("parses");
+            let printed = once.to_string();
+            let twice = super::parse(&printed).expect("the printed tree should re-parse");
+
+            assert_eq!(once, twice, "{query:?} printed as {printed:?}");
+        }
+    }
+
+    #[test]
+    fn walking_a_tree_visits_every_node() {
+        let expression = super::parse("a AND (b OR c)").expect("parses");
+
+        let mut terms = Vec::new();
+        expression.walk(&mut |node| {
+            if let super::Expr::Term(term) = node {
+                terms.push(term.clone());
+            }
+        });
+
+        assert_eq!(terms, ["a", "b", "c"]);
+        // Three terms plus an AND plus an OR.
+        assert_eq!(expression.size(), 5);
+    }
+
+    #[test]
+    fn an_empty_query_is_refused() {
+        assert_eq!(parse_error_span(""), (0, 0));
+        assert!(parse_message("   ").contains("empty"));
+    }
+
+    #[test]
+    fn a_dangling_operator_points_past_the_end() {
+        let query = "quantum AND";
+        let (offset, length) = parse_error_span(query);
+
+        assert_eq!(offset, query.len(), "should point at the end of the query");
+        assert_eq!(length, 0);
+        assert!(
+            parse_message(query).contains("AND"),
+            "{}",
+            parse_message(query)
+        );
+    }
+
+    #[test]
+    fn a_dangling_near_points_past_the_end() {
+        let query = "quantum NEAR/3";
+        assert_eq!(parse_error_span(query), (query.len(), 0));
+        assert!(parse_message(query).contains("NEAR"));
+    }
+
+    #[test]
+    fn a_leading_operator_points_at_the_operator() {
+        let query = "AND quantum";
+        let (offset, length) = parse_error_span(query);
+
+        assert_eq!(&query[offset..offset + length], "AND");
+    }
+
+    #[test]
+    fn two_operators_in_a_row_point_at_the_second() {
+        let query = "a AND OR b";
+        let (offset, length) = parse_error_span(query);
+
+        assert_eq!(&query[offset..offset + length], "OR");
+    }
+
+    #[test]
+    fn an_unclosed_group_points_at_the_opening_parenthesis() {
+        let query = "quantum AND (a OR b";
+        let (offset, length) = parse_error_span(query);
+
+        assert_eq!(&query[offset..offset + length], "(");
+        assert!(parse_message(query).contains("never closed"));
+    }
+
+    #[test]
+    fn a_stray_closing_parenthesis_points_at_itself() {
+        let query = "quantum) AND b";
+        let (offset, length) = parse_error_span(query);
+
+        assert_eq!(&query[offset..offset + length], ")");
+        assert!(parse_message(query).contains("no opening one"));
+    }
+
+    #[test]
+    fn an_empty_group_is_refused() {
+        let query = "a AND ()";
+        let (offset, length) = parse_error_span(query);
+
+        assert_eq!(&query[offset..offset + length], "()");
+        assert!(parse_message(query).contains("empty"));
+    }
+
+    #[test]
+    fn a_parse_error_span_lands_on_character_boundaries() {
+        // If the span were byte-naive, slicing a multi-byte query would panic.
+        let query = "naïve AND OR 量子";
+        let (offset, length) = parse_error_span(query);
+
+        assert_eq!(&query[offset..offset + length], "OR");
+        let _ = point_at(query, offset, length);
     }
 }
