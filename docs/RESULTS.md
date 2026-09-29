@@ -267,3 +267,131 @@ error: invalid query at byte 11: AND stops here, but something has to come after
 Something *missing* gets a zero-width span at the end of the query; something
 *wrong* gets the span of the offending lexeme. Both survive multi-byte text,
 because the caret counts characters.
+
+## Day 8 — Boolean evaluation
+
+Machine for this section: 2-core Linux container, 1,000,000 synthetic records
+with Zipfian term frequencies (200,000 terms, 126M postings, 160M positions,
+1.5 GiB index). Zipf is the point — a uniform vocabulary would never produce
+the rare-term-meets-common-term pair that the whole day is about.
+
+### Query latency
+
+Cold, one run per query, timing `evaluate` only. `%` is of the corpus.
+
+| Query | Hits | % | Latency |
+| --- | --- | --- | --- |
+| `kephopyr23` (a rare term) | 60 | 0.006% | 3 µs |
+| `quantum` | 681,275 | 68% | 2.0 ms |
+| `quantum AND kephopyr23` | 40 | 0.004% | 85 µs |
+| `the AND quantum AND kephopyr23` | 40 | 0.004% | 0.4–1.7 ms |
+| `quantum AND entanglement` | 369,310 | 37% | 12 ms |
+| `quantum AND entanglement NOT classical` | 151,914 | 15% | 17 ms |
+| `quantum OR entanglement OR classical` | 941,306 | 94% | 15 ms |
+| `(quantum OR classical) AND decay NOT the` | 1 | 0.0001% | 22 ms |
+| `quantum AND flurbles AND entanglement` | 0 | 0% | 3 µs |
+
+Four things to read off it.
+
+**Cost tracks the answer, not the corpus.** A rare term costs 3 µs and a term
+in two thirds of the corpus costs 2 ms — a factor of 600 on a corpus of fixed
+size. The 2 ms is not searching; it is `memcpy` of 681,275 document ids.
+
+**A term nobody indexed costs nothing.** `quantum AND flurbles AND
+entanglement` is 3 µs because the planner puts the empty list first and the
+loop stops. The same query written widest-first would walk two lists of
+hundreds of thousands of documents to reach the same answer.
+
+**The expensive queries are the ones with big answers.** 12–22 ms for queries
+matching 15–94% of a million documents. There is no skipping to be had when
+both operands are everywhere; the work is proportional to the output.
+
+**The last row is honest about what `NOT` does not buy you.**
+`(quantum OR classical) AND decay NOT the` returns one document and still
+costs 22 ms, because the `OR` has to be materialised in full before anything
+can narrow it. Day 13 revisits this.
+
+### Galloping search: measured, then made conditional
+
+The plan said to use galloping search "when one list is far shorter than the
+other". The measurement is what defines *far*. Intersecting one term's postings
+against `the` (999,997 documents), best of 25–200 runs, cache-warm:
+
+| Shorter list | Ratio | Adaptive | Always gallop | Always step |
+| --- | --- | --- | --- | --- |
+| 35 | 28571:1 | **2.9 µs** | 2.9 µs | 2,371 µs |
+| 60 | 16667:1 | **5.1 µs** | 5.1 µs | 2,326 µs |
+| 200 | 5000:1 | **14 µs** | 14 µs | 2,419 µs |
+| 700 | 1429:1 | **40 µs** | 40 µs | 2,415 µs |
+| 2,500 | 400:1 | **208 µs** | 209 µs | 2,445 µs |
+| 9,008 | 111:1 | **390 µs** | 389 µs | 2,544 µs |
+| 30,020 | 33:1 | **856 µs** | 859 µs | 2,819 µs |
+| 100,955 | 10:1 | **2.35 ms** | 2.36 ms | 3.94 ms |
+| 300,524 | 3:1 | 6.56 ms | **5.69 ms** | 6.65 ms |
+| 681,275 | 1:1 | **7.83 ms** | 8.32 ms | 8.25 ms |
+
+**Galloping is 800× faster at one end and slower at the other.** At 28571:1 it
+is 2.9 µs against 2.4 ms. At 1:1 an earlier run of the same benchmark had it
+27% *slower* than stepping, and this run 1% slower. The window arithmetic costs
+more than `&slice[1..]`, and the unpredictable branch costs more again.
+
+That is why `intersect` does not simply gallop. `Strategy::Adaptive` compares
+the two lengths once and gallops only past `GALLOP_RATIO` (8:1). The 3:1 row is
+the price of that choice — 15% off the best available — and it is deliberate:
+across runs the crossover moved between 2:1 and 10:1, so the threshold sits on
+the far side of the only ratio measured as a clear loss. Chasing the true
+crossover would be fitting a constant to noise.
+
+**Cache-cold costs ten to twenty times more than cache-warm.** The CLI reports
+85 µs for `quantum AND kephopyr23`; the table's equivalent row is 5 µs. Both
+are correct. 60 galloped probes into a 2.7 MB postings array is 60 × ~14 cache
+misses on the first pass and nearly free on the two-hundredth. The CLI number
+is the one a user gets.
+
+### The planner earns more than the search algorithm does
+
+Three clauses, `the` (999,997 docs) AND `quantum` (681,275) AND `kephopyr23`
+(60), folded left to right:
+
+| Order | Time |
+| --- | --- |
+| As written — widest first | 8.05 ms |
+| As planned — rarest first | 8.6 µs |
+| | **935× faster** |
+
+Same operator, same data, same galloping. The only difference is which
+intersection happens first. Written order builds a 369,000-element intermediate
+and then throws away all but 40 of it; planned order is down to 60 candidates
+before it touches the long lists at all.
+
+This is the day's real lesson. Galloping is the clever part and it bought 800×
+in its best case; deciding *what order to do the work in* bought 935× on an
+ordinary three-word query. The planner is 40 lines: flatten the `AND` spine,
+look up each term's document frequency, `sort_by_key`.
+
+### `NOT` is binary, and this is the arithmetic
+
+A unary `NOT classical` over this corpus would return 408,495 documents — and
+over the real 2.7M arXiv dump, roughly a million. `a NOT b` is bounded by `a`:
+`difference` walks the left list once and skips through the right, so
+`quantum AND entanglement NOT classical` costs 5 ms more than
+`quantum AND entanglement`, not 400,000 documents' worth.
+
+Exclusions are also hoisted to the end of the conjunction, which is sound
+because `x ∧ ¬y` commutes with any further `∧`: `(a NOT b) AND c` and
+`(a AND c) NOT b` are the same set. Doing them last means subtracting from the
+smallest list the query will ever produce.
+
+### Correctness
+
+209 tests. The load-bearing one is a property test: random `AND`/`OR`/`NOT`
+trees up to four levels deep over the fixture's real vocabulary, evaluated by
+the engine and by `BTreeMap<String, BTreeSet<DocId>>` with standard-library set
+algebra, asserted equal. The reference shares no code with the engine — no
+galloping, no compressed-sparse-row arrays, no planner — so agreement is
+evidence rather than coincidence.
+
+`gallop` is also checked exhaustively against `partition_point` for every
+haystack length from 0 to 39 and every needle in range: 33,000 assertions
+against the standard library, because power-of-two window arithmetic is exactly
+the kind of code that is right for eight elements and off by one for nine.

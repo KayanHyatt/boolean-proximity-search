@@ -9,7 +9,8 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use boolsearch::{
-    DocStore, Document, Error, Expr, IndexBuilder, JsonlCorpus, Result, SearchIndex, parse,
+    DocStore, Document, Error, Expr, IndexBuilder, JsonlCorpus, Result, SearchIndex, evaluate,
+    parse,
 };
 use clap::{Parser, Subcommand};
 
@@ -306,54 +307,84 @@ fn search_index(query: &str, path: &Path, limit: usize) -> Result<()> {
         format_duration(loaded),
     );
 
-    let Expr::Term(term) = &expression else {
+    println!();
+    println!("  {expression}");
+
+    // Every distinct term in the query with the number of documents it appears
+    // in — the only numbers the planner gets to look at, and the reason it
+    // intersects in this order rather than the written one.
+    let mut frequencies: Vec<(String, usize)> = Vec::new();
+    expression.walk(&mut |node| {
+        if let Expr::Term(term) = node {
+            if !frequencies.iter().any(|(seen, _)| seen == term) {
+                let documents = bundle
+                    .index
+                    .term_id(term)
+                    .map_or(0, |id| bundle.index.document_frequency(id));
+                frequencies.push((term.clone(), documents));
+            }
+        }
+    });
+    frequencies.sort_by_key(|&(_, documents)| documents);
+
+    if !frequencies.is_empty() {
         println!();
-        println!("  parsed, {} node(s):", expression.size());
-        println!();
-        println!("    {expression}");
-        println!();
-        println!("  Day 8 evaluates this tree.");
-        return Ok(());
-    };
+        println!("  terms, rarest first — the order the planner intersects in:");
+        for (term, documents) in &frequencies {
+            println!(
+                "    {:<24} {:>12}",
+                truncate(term, 24),
+                format_count(*documents as f64)
+            );
+        }
+    }
 
     let started = Instant::now();
-    let found = bundle.index.postings_for(term);
+    let matches = evaluate(&expression, &bundle.index)?;
     let elapsed = started.elapsed();
 
     println!();
-    let Some(postings) = found else {
-        println!("  {term:?} does not appear in the corpus.");
-        return Ok(());
-    };
-
-    let matches = postings.len();
     println!(
-        "  {term:?} — {} documents ({:.2}% of the corpus), found in {:?}",
-        format_count(matches as f64),
-        100.0 * matches as f64 / stats.documents.max(1) as f64,
-        elapsed,
+        "  {} document(s), {:.4}% of the corpus, in {}",
+        format_count(matches.len() as f64),
+        100.0 * matches.len() as f64 / stats.documents.max(1) as f64,
+        format_duration(elapsed),
     );
+
+    if matches.is_empty() {
+        return Ok(());
+    }
     println!();
 
-    for posting in postings.take(limit) {
-        let meta = bundle.documents.get(posting.doc_id);
+    for &doc_id in matches.iter().take(limit) {
+        let meta = bundle.documents.get(doc_id);
         let title = meta.map_or("<unknown>", |meta| meta.title.as_str());
         let external = meta.map_or("", |meta| meta.external_id.as_str());
 
         println!("  {external:<12} {}", truncate(title, 62));
-        println!(
-            "  {:<12} {} occurrence(s) at {:?}",
-            "",
-            posting.frequency(),
-            &posting.positions[..posting.positions.len().min(8)],
-        );
+
+        // Where the query's terms actually land. Not needed to answer the
+        // query, but it is the positional data day 9's phrase search will
+        // depend on, so being able to see it now is worth six lines.
+        let mut occurrences = String::new();
+        for (term, _) in &frequencies {
+            let Some(id) = bundle.index.term_id(term) else {
+                continue;
+            };
+            let Ok(nth) = bundle.index.doc_ids(id).binary_search(&doc_id) else {
+                continue;
+            };
+            let positions = bundle.index.positions(id, nth);
+            occurrences.push_str(&format!(" {term}×{}", positions.len()));
+        }
+        println!("  {:<12}{occurrences}", "");
     }
 
-    if matches > limit {
+    if matches.len() > limit {
         println!();
         println!(
             "  ... {} more (raise --limit)",
-            format_count((matches - limit) as f64)
+            format_count((matches.len() - limit) as f64)
         );
     }
 
@@ -418,10 +449,19 @@ fn format_count(count: f64) -> String {
 /// Formats a duration at a sensible precision for a human reading a report.
 fn format_duration(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs_f64();
+    // Day 8 made microseconds a normal answer: a rare term meeting a common
+    // one is thousands of times faster than a query over two common ones, and
+    // rounding both to "0 ms" would hide the entire point of galloping.
     if seconds >= 1.0 {
         format!("{seconds:.2} s")
+    } else if seconds >= 0.01 {
+        format!("{:.0} ms", seconds * 1e3)
+    } else if seconds >= 0.001 {
+        format!("{:.2} ms", seconds * 1e3)
+    } else if seconds >= 0.000_001 {
+        format!("{:.0} \u{b5}s", seconds * 1e6)
     } else {
-        format!("{:.0} ms", seconds * 1000.0)
+        format!("{:.0} ns", seconds * 1e9)
     }
 }
 
@@ -611,12 +651,21 @@ mod tests {
     }
 
     #[test]
-    fn durations_switch_from_milliseconds_to_seconds() {
+    fn durations_pick_a_unit_that_shows_something() {
         use std::time::Duration;
         assert_eq!(super::format_duration(Duration::from_millis(250)), "250 ms");
         assert_eq!(
             super::format_duration(Duration::from_millis(1500)),
             "1.50 s"
         );
+        assert_eq!(
+            super::format_duration(Duration::from_micros(1500)),
+            "1.50 ms"
+        );
+        assert_eq!(
+            super::format_duration(Duration::from_micros(40)),
+            "40 \u{b5}s"
+        );
+        assert_eq!(super::format_duration(Duration::from_nanos(300)), "300 ns");
     }
 }

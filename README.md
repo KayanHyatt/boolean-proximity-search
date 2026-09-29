@@ -36,7 +36,7 @@ arXiv metadata dump — ~2.7M paper abstracts, one JSON object per line. Every
 stage takes a `--limit` so development runs on 10k documents and benchmarks run
 on the full set.
 
-## Planned query language
+## Query language
 
 | Syntax | Meaning |
 | --- | --- |
@@ -49,6 +49,10 @@ on the full set.
 | `a NEAR/3 b` | within 3 positions, either order |
 | `a ONEAR/3 b` | within 3 positions, `a` first |
 | `comp*` | prefix wildcard |
+
+`AND`, `OR`, `NOT`, grouping and the implicit `AND` **work today**. Phrases,
+`NEAR`/`ONEAR` and prefix wildcards parse correctly and report
+`not implemented yet` — days 9 to 11 of the plan fill them in.
 
 Operators are **uppercase only**, so `cats and dogs` searches for the word
 "and" rather than silently becoming an operator.
@@ -63,7 +67,10 @@ A word the tokenizer splits becomes the phrase it has to become:
 `state-of-the-art` is four adjacent terms, because that is how the index
 stored it.
 
-Precedence, tightest first: `NOT` → `NEAR` → `AND` → `OR`.
+Precedence, tightest first: `NEAR` → `AND`/`NOT` → `OR`. `AND` and `NOT`
+share a level and associate left, because `NOT` here is the binary difference
+`a NOT b` rather than a unary negation — so `a NOT b NOT c` reads left to
+right, and `a OR b AND c` means `a OR (b AND c)` the way `+` and `*` do.
 
 ## Build
 
@@ -72,9 +79,28 @@ Requires Rust 1.85 or newer (edition 2024).
 ```bash
 cargo build --release
 cargo run --release -- index --input arxiv.jsonl --limit 100000
-cargo run --release -- search 'quantum AND "error correction"'
+cargo run --release -- search 'quantum AND entanglement NOT classical'
 cargo run --release -- bench
 ```
+
+`search` prints the parsed tree, each term's document frequency in the order
+the planner intersects them, and the hits:
+
+```
+  ((quantum AND entanglement) NOT classical)
+
+  terms, rarest first — the order the planner intersects in:
+    entanglement                  543,439
+    classical                     591,505
+    quantum                       681,275
+
+  151,914 document(s), 15.1914% of the corpus, in 17 ms
+```
+
+Intersecting the rarest list first is worth 935× on a three-clause query, and
+skipping ahead by exponential search instead of stepping is worth up to 800×
+when one list is far shorter than the other. Both are measured in
+[`docs/RESULTS.md`](docs/RESULTS.md).
 
 ## License
 

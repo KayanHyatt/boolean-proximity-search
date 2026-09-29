@@ -38,4 +38,8 @@ pub use crate::index::{
     FIELD_GAP, Index, IndexAssembler, IndexBuilder, IndexStats, Posting, Postings, TermId,
 };
 pub use crate::query::{Expr, Lexeme, LexemeKind, Span, lex, parse, point_at};
+pub use crate::search::{
+    Difference, GALLOP_RATIO, Intersection, Strategy, Union, difference, difference_with, evaluate,
+    intersect, intersect_with, union,
+};
 pub use crate::tokenize::{Token, Tokens, tokenize};
