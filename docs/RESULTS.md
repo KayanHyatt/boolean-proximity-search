@@ -395,3 +395,36 @@ evidence rather than coincidence.
 haystack length from 0 to 39 and every needle in range: 33,000 assertions
 against the standard library, because power-of-two window arithmetic is exactly
 the kind of code that is right for eight elements and off by one for nine.
+
+### Day 8 addendum — real corpus, real hardware
+
+Kayan's laptop, 500,000 arXiv records (291,917 terms, 41.9M postings, 72.6M
+positions, 605.8 MiB index; load 386–763 ms).
+
+| Query | Hits | % | Latency |
+| --- | --- | --- | --- |
+| `quantum AND entanglement NOT classical` | 3,874 | 0.77% | **220 µs** |
+| `quantum AND flurbles AND entanglement` | 0 | 0% | **8 µs** |
+
+The same query took **17 ms** on the container's synthetic corpus — 77 times
+slower on half as many documents again. The synthetic corpus was not wrong; it
+was the worst case, and it took real data to notice.
+
+| Term | Synthetic (1M docs) | Real arXiv (500k docs) |
+| --- | --- | --- |
+| `entanglement` | 543,439 (54%) | 7,072 (1.4%) |
+| `classical` | 591,505 (59%) | 27,519 (5.5%) |
+| `quantum` | 681,275 (68%) | 56,630 (11.3%) |
+
+Zipf's law put the synthetic vocabulary's anchor words at ranks 11–16 of
+200,000, so every one of them landed in most documents and no intersection
+could skip anything. Real English over real abstracts is far steeper in the
+tail: the rarest clause is 77× smaller, so the planner starts from 7,072
+candidates instead of 543,439 and galloping has somewhere to gallop to.
+
+**The lesson is about the benchmark, not the engine.** Two thirds of the
+corpus matching a term is not a realistic query; it is a stress test. Day 12's
+harness needs its query set drawn from the real corpus's own frequency
+distribution, or the percentiles it reports will describe a corpus nobody has.
+Both numbers stay in this file: 220 µs is what a user gets, 17 ms is the
+ceiling when every clause is common.
