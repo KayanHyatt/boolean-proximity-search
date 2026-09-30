@@ -28,10 +28,32 @@
 //! corpus would materialise nearly the whole corpus to answer a question nobody
 //! meant to ask.
 //!
+//! # Phrases
+//!
+//! `"exact phrase"` is where the positions the index has been carrying since
+//! day 4 finally pay for themselves. Day 9 does it in two stages, and the
+//! first stage is day 8's work unchanged: intersect the words' *document*
+//! lists, then look at positions only in the documents that survive.
+//!
+//! ```text
+//!   "quantum theory"
+//!   quantum  in doc 40 at [ 7, 41, 118 ]
+//!   theory   in doc 40 at [ 8, 92 ]
+//!                            ▲
+//!   7 + 1 = 8, so doc 40 matches
+//! ```
+//!
+//! Inside a document, the check anchors on the word with the fewest
+//! occurrences — the planner's rarest-first idea one level down. `the` might
+//! occur thirty times in an abstract and `gravity` twice, and anchoring on
+//! `gravity` means testing two alignments instead of thirty.
+//!
 //! Day 10 forces a design change worth anticipating: `("machine learning")
-//! NEAR/5 medical` means a `NEAR` operand must expose *positions*, not just
-//! documents, so evaluation returns positions throughout and discards them only
-//! at the top level.
+//! NEAR/5 medical` means a `NEAR` *operand* must expose positions, not just
+//! documents, so a positional layer will have to sit alongside the document
+//! one. Day 9 does not need it — a phrase's operands are always plain terms,
+//! so a phrase reads positions straight out of the index and hands back
+//! documents like everything else.
 //!
 //! # Set operations as iterators
 //!
@@ -56,7 +78,7 @@ use std::cmp::Ordering;
 
 use crate::corpus::DocId;
 use crate::error::{Error, Result};
-use crate::index::Index;
+use crate::index::{Index, TermId};
 use crate::query::Expr;
 
 // ---------------------------------------------------------------------------
@@ -350,8 +372,8 @@ impl Iterator for Difference<'_> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::NotImplemented`] for phrase, `NEAR` and prefix operators,
-/// which days 9 to 11 fill in. The check happens before any work, so a query
+/// Returns [`Error::NotImplemented`] for the `NEAR` and prefix operators,
+/// which days 10 and 11 fill in. The check happens before any work, so a query
 /// using one fails the same way whether or not its other clauses match
 /// anything.
 pub fn evaluate(expression: &Expr, index: &Index) -> Result<Vec<DocId>> {
@@ -429,6 +451,7 @@ fn evaluate_conjunction(expression: &Expr, index: &Index) -> Result<Vec<DocId>> 
 fn evaluate_branch(expression: &Expr, index: &Index) -> Result<Vec<DocId>> {
     match expression {
         Expr::Term(term) => Ok(term_docs(term, index).to_vec()),
+        Expr::Phrase(terms) => Ok(evaluate_phrase(terms, index)),
         Expr::And(..) | Expr::Not(..) => evaluate_conjunction(expression, index),
         Expr::Or(left, right) => {
             let left = evaluate_branch(left, index)?;
@@ -437,8 +460,8 @@ fn evaluate_branch(expression: &Expr, index: &Index) -> Result<Vec<DocId>> {
         }
         // Unreachable in practice: `evaluate` rejects these up front. Answered
         // rather than panicked because a total function is one fewer thing to
-        // be careful about when days 9 to 11 rewrite this match.
-        Expr::Phrase(_) | Expr::Near { .. } | Expr::Prefix(_) => Err(Error::NotImplemented(
+        // be careful about when days 10 and 11 rewrite this match.
+        Expr::Near { .. } | Expr::Prefix(_) => Err(Error::NotImplemented(
             unsupported(expression).unwrap_or("this operator"),
         )),
     }
@@ -466,6 +489,147 @@ fn flatten<'a>(expression: &'a Expr, required: &mut Vec<&'a Expr>, excluded: &mu
         }
         other => required.push(other),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phrases
+// ---------------------------------------------------------------------------
+
+/// One term of a phrase, with a cursor into its postings.
+///
+/// `nth` is the cursor. [`Index::positions`] indexes a term's own postings
+/// rather than the corpus, so turning a [`DocId`] into a position list means
+/// knowing *which* of this term's postings that document is. The candidate
+/// documents arrive in ascending order, so the cursor only ever moves forward
+/// and the whole scan costs one pass over each term's postings — rather than a
+/// binary search over the full list per candidate, which is what calling
+/// `doc_ids(..).binary_search(..)` every time would cost.
+#[derive(Debug)]
+struct PhraseTerm {
+    id: TermId,
+    /// Position of this term within the phrase: 0 for the first word.
+    offset: u32,
+    /// How many of this term's postings the cursor has passed.
+    nth: usize,
+}
+
+/// The documents where `terms` occur at consecutive positions, in order.
+///
+/// Two stages, and the first one is day 8's work reused. Intersect the terms'
+/// document lists rarest-first to get the documents that hold *all* the words;
+/// only then look at positions. Checking positions is far more expensive per
+/// document than comparing document ids, so the cheap filter has to run first:
+/// `"the quantum theory"` touches three positional lists per surviving
+/// document, and there is no point paying that for a document that does not
+/// contain `theory` at all.
+///
+/// The positional check anchors on whichever term has the fewest occurrences
+/// *in that document* — the same rarest-first idea as the planner, applied one
+/// level down. In `"the quantum theory of gravity"`, `the` may occur thirty
+/// times in an abstract and `gravity` twice; anchoring on `gravity` means two
+/// candidate alignments to check instead of thirty.
+///
+/// A phrase cannot straddle the title/body join, because
+/// [`FIELD_GAP`](crate::FIELD_GAP) is 100 and no phrase anyone writes is a
+/// hundred words long. That is the whole reason the gap exists.
+fn evaluate_phrase(terms: &[String], index: &Index) -> Vec<DocId> {
+    // `lex_phrase` never produces either of these — an empty phrase is a lex
+    // error and a one-word phrase is lexed as a bare term — but `Expr` is
+    // public, so the function has to be honest about them anyway.
+    match terms {
+        [] => return Vec::new(),
+        [single] => return term_docs(single, index).to_vec(),
+        _ => {}
+    }
+
+    // A term the corpus has never seen cannot be part of any phrase in it.
+    let mut phrase = Vec::with_capacity(terms.len());
+    for (offset, term) in terms.iter().enumerate() {
+        let Some(id) = index.term_id(term) else {
+            return Vec::new();
+        };
+        let Ok(offset) = u32::try_from(offset) else {
+            return Vec::new();
+        };
+        phrase.push(PhraseTerm { id, offset, nth: 0 });
+    }
+
+    // Stage one: the documents holding every word, rarest list first.
+    let mut order: Vec<usize> = (0..phrase.len()).collect();
+    order.sort_by_key(|&slot| index.document_frequency(phrase[slot].id));
+
+    let mut candidates = index.doc_ids(phrase[order[0]].id).to_vec();
+    let mut already = vec![phrase[order[0]].id];
+    for &slot in &order[1..] {
+        if candidates.is_empty() {
+            return candidates;
+        }
+        // `"the cat the cat"` names the same term twice. Intersecting a list
+        // with itself is a no-op, so skip it rather than walk it.
+        let id = phrase[slot].id;
+        if already.contains(&id) {
+            continue;
+        }
+        already.push(id);
+
+        let narrowed = intersect(&candidates, index.doc_ids(id)).collect();
+        candidates = narrowed;
+    }
+
+    // Stage two: of those, the ones where the words are actually adjacent.
+    // Allocated once and reused, because this runs per surviving document.
+    let mut positions: Vec<&[u32]> = Vec::with_capacity(phrase.len());
+    candidates.retain(|&doc| phrase_occurs(&mut phrase, &mut positions, index, doc));
+
+    candidates
+}
+
+/// Whether the phrase occurs in `doc`, advancing each term's cursor to it.
+///
+/// `doc` must be a document that contains every term and must not precede any
+/// cursor — both guaranteed by the caller, which walks the intersection of the
+/// terms' document lists in ascending order.
+fn phrase_occurs<'a>(
+    phrase: &mut [PhraseTerm],
+    positions: &mut Vec<&'a [u32]>,
+    index: &'a Index,
+    doc: DocId,
+) -> bool {
+    positions.clear();
+    for term in phrase.iter_mut() {
+        // Walk the cursor up to this document. Over the whole candidate list
+        // this is one linear pass through the postings, not a search per
+        // document.
+        let docs = index.doc_ids(term.id);
+        term.nth += docs[term.nth..].partition_point(|&seen| seen < doc);
+        positions.push(index.positions(term.id, term.nth));
+    }
+
+    // Anchor on the term with the fewest occurrences here: every occurrence of
+    // it is one alignment to test, and every other term is then a lookup.
+    let Some(anchor) = (0..phrase.len()).min_by_key(|&slot| positions[slot].len()) else {
+        return false;
+    };
+
+    for &occurrence in positions[anchor] {
+        // If the anchor is the phrase's third word and it sits at position 7,
+        // the phrase would have to start at 5.
+        let Some(start) = occurrence.checked_sub(phrase[anchor].offset) else {
+            continue;
+        };
+
+        let aligned = phrase.iter().enumerate().all(|(slot, term)| {
+            positions[slot]
+                .binary_search(&start.saturating_add(term.offset))
+                .is_ok()
+        });
+
+        if aligned {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// An upper bound on how many documents `expression` can match.
@@ -512,10 +676,9 @@ fn unsupported(expression: &Expr) -> Option<&'static str> {
 
     expression.walk(&mut |node| {
         let feature = match node {
-            Expr::Phrase(_) => Some("the phrase operator"),
             Expr::Near { .. } => Some("the NEAR operator"),
             Expr::Prefix(_) => Some("prefix search"),
-            Expr::Term(_) | Expr::And(..) | Expr::Or(..) | Expr::Not(..) => None,
+            Expr::Term(_) | Expr::Phrase(_) | Expr::And(..) | Expr::Or(..) | Expr::Not(..) => None,
         };
 
         // `walk` visits parents before children, so the first hit is the
@@ -532,8 +695,8 @@ fn unsupported(expression: &Expr) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Expr, Index, Strategy, difference, difference_with, estimate, evaluate, flatten, gallop,
-        intersect, intersect_with, union,
+        Expr, Index, Strategy, difference, difference_with, estimate, evaluate, evaluate_phrase,
+        flatten, gallop, intersect, intersect_with, union,
     };
     use crate::corpus::{DocId, Document};
     use crate::index::IndexBuilder;
@@ -574,6 +737,34 @@ mod tests {
             assembler.add_document(document);
         }
         assembler.finish().expect("same corpus twice")
+    }
+
+    /// An index over `(title, body)` pairs, for the phrase tests.
+    fn index_of(corpus: &[(&str, &str)]) -> Index {
+        let documents: Vec<Document> = corpus
+            .iter()
+            .enumerate()
+            .map(|(nth, (title, body))| Document {
+                id: DocId::new(u32::try_from(nth).expect("small corpus")),
+                external_id: format!("d{nth}"),
+                title: (*title).to_owned(),
+                body: (*body).to_owned(),
+            })
+            .collect();
+
+        let mut builder = IndexBuilder::new();
+        for document in &documents {
+            builder.add_document(document);
+        }
+        let mut assembler = builder.finish_counting().expect("tiny corpus");
+        for document in &documents {
+            assembler.add_document(document);
+        }
+        assembler.finish().expect("same corpus twice")
+    }
+
+    fn phrase(words: &str) -> Expr {
+        Expr::Phrase(words.split(' ').map(str::to_owned).collect())
     }
 
     fn term(name: &str) -> Expr {
@@ -867,11 +1058,168 @@ mod tests {
     }
 
     #[test]
+    fn a_phrase_matches_only_consecutive_terms_in_order() {
+        let index = index_of(&[
+            ("", "the quantum theory of gravity"),
+            ("", "quantum gravity without the theory"),
+            ("", "a theory of quantum computing"),
+            ("", "loop theory quantum corrections"),
+        ]);
+
+        let cases = [
+            ("quantum theory", vec![0]),
+            ("theory of gravity", vec![0]),
+            // The near miss the plan asks for: the same two words, and only the
+            // document that has them in *this* order comes back. Document 2
+            // holds both words two apart and must not match either way.
+            ("theory quantum", vec![3]),
+            ("the quantum theory of gravity", vec![0]),
+            ("quantum gravity", vec![1]),
+            ("gravity quantum", vec![]),
+            ("quantum theory of gravity", vec![0]),
+        ];
+
+        for (words, expected) in cases {
+            let found = evaluate(&phrase(words), &index).expect("phrases work from day 9");
+            assert_eq!(raw(&found), expected, "{words:?}");
+        }
+    }
+
+    #[test]
+    fn a_phrase_can_repeat_a_word() {
+        // Two slots share one `TermId`, each with its own cursor, and the
+        // document-list intersection must not walk `the`'s postings twice.
+        let index = index_of(&[
+            ("", "the more the merrier"),
+            ("", "the merrier the more"),
+            ("", "more of the merrier"),
+        ]);
+
+        assert_eq!(
+            raw(&evaluate(&phrase("the more the merrier"), &index).unwrap()),
+            [0]
+        );
+        assert_eq!(
+            raw(&evaluate(&phrase("more the merrier"), &index).unwrap()),
+            [0]
+        );
+        assert_eq!(
+            raw(&evaluate(&phrase("the the"), &index).unwrap()),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn a_phrase_cannot_straddle_the_title_body_join() {
+        // `FIELD_GAP` exists for exactly this: the last word of the title and
+        // the first of the body are not adjacent, however they read.
+        let index = index_of(&[("prompt diphoton production", "cross sections at Tevatron")]);
+
+        assert_eq!(
+            raw(&evaluate(&phrase("diphoton production"), &index).unwrap()),
+            [0]
+        );
+        assert_eq!(
+            raw(&evaluate(&phrase("cross sections"), &index).unwrap()),
+            [0]
+        );
+        assert!(
+            evaluate(&phrase("production cross"), &index)
+                .expect("phrases work")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_phrase_containing_an_unknown_word_matches_nothing() {
+        let index = index_of(&[("", "quantum theory of gravity")]);
+
+        assert!(
+            evaluate(&phrase("quantum flurbles"), &index)
+                .expect("an unknown term is not an error")
+                .is_empty()
+        );
+        assert!(
+            evaluate(&phrase("flurbles quantum"), &index)
+                .expect("an unknown term is not an error")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn degenerate_phrases_are_answered_rather_than_panicked() {
+        // `lex_phrase` cannot produce either — an empty phrase is a lex error
+        // and a one-word phrase is lexed as a bare term — but `Expr` is public.
+        let index = index_of(&[("", "quantum theory")]);
+
+        assert!(
+            evaluate(&Expr::Phrase(Vec::new()), &index)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            evaluate(&Expr::Phrase(vec!["quantum".to_owned()]), &index).unwrap(),
+            evaluate(&term("quantum"), &index).unwrap()
+        );
+    }
+
+    #[test]
+    fn phrases_compose_with_the_boolean_operators() {
+        let index = index_of(&[
+            ("", "the quantum theory of gravity"),
+            ("", "quantum theory without gravity"),
+            ("", "a classical theory of gravity"),
+        ]);
+
+        let cases = [
+            (and(phrase("quantum theory"), term("gravity")), vec![0, 1]),
+            (not(phrase("quantum theory"), term("gravity")), vec![]),
+            (
+                or(phrase("quantum theory"), phrase("classical theory")),
+                vec![0, 1, 2],
+            ),
+            (and(phrase("theory of gravity"), term("quantum")), vec![0]),
+        ];
+
+        for (expression, expected) in cases {
+            let found = evaluate(&expression, &index).expect("phrases work");
+            assert_eq!(raw(&found), expected, "{expression}");
+        }
+    }
+
+    #[test]
+    fn the_planner_treats_a_phrase_as_no_commoner_than_its_rarest_word() {
+        let index = index_of(&[
+            ("", "the quantum theory"),
+            ("", "the classical theory"),
+            ("", "the theory"),
+        ]);
+
+        // `the` is in all three, `quantum` in one; the phrase cannot beat one.
+        assert_eq!(estimate(&phrase("the quantum"), &index), 1);
+        // And that bound really does hold for the answer.
+        let found = evaluate(&phrase("the quantum"), &index).expect("phrases work");
+        assert!(estimate(&phrase("the quantum"), &index) >= found.len());
+    }
+
+    #[test]
+    fn evaluate_phrase_is_reached_through_the_planner_too() {
+        // A phrase nested as an `AND` branch goes through `evaluate_branch`,
+        // and one at the top goes straight to `evaluate_phrase`. Same answer.
+        let index = index_of(&[("", "quantum theory of gravity")]);
+        let words = ["quantum".to_owned(), "theory".to_owned()];
+
+        assert_eq!(
+            evaluate(&phrase("quantum theory"), &index).unwrap(),
+            evaluate_phrase(&words, &index)
+        );
+    }
+
+    #[test]
     fn later_days_operators_say_so_instead_of_answering_wrongly() {
         let index = index();
 
         let cases = [
-            (Expr::Phrase(vec!["alpha".to_owned()]), "phrase operator"),
             (Expr::Prefix("alph".to_owned()), "prefix search"),
             (
                 Expr::Near {

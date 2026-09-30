@@ -13,6 +13,12 @@
 //! gallop window, or a planner that reordered an exclusion it should not have,
 //! would show up as a disagreement rather than as a plausible-looking list of
 //! documents.
+//!
+//! Phrases get a second, even blunter reference (day 9): each document's terms
+//! as one flat `Vec<String>` with a sentinel between title and body, searched
+//! with `windows(k)`. It knows nothing of positions, postings or `FIELD_GAP` —
+//! it just looks for the words next to each other, the way a person reading the
+//! document would.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -75,31 +81,99 @@ fn reference_of(documents: &[Document]) -> Reference {
 ///
 /// Recursive, allocating, and quadratic in places. All three are fine: it only
 /// ever sees twenty documents, and being obviously right is its entire job.
-fn brute_force(expression: &Expr, reference: &Reference) -> BTreeSet<DocId> {
+fn brute_force(expression: &Expr, fixture: &Fixture) -> BTreeSet<DocId> {
     match expression {
-        Expr::Term(term) => reference.get(term).cloned().unwrap_or_default(),
-        Expr::And(left, right) => brute_force(left, reference)
-            .intersection(&brute_force(right, reference))
+        Expr::Term(term) => fixture.reference.get(term).cloned().unwrap_or_default(),
+        Expr::Phrase(terms) => brute_force_phrase(terms, &fixture.words),
+        Expr::And(left, right) => brute_force(left, fixture)
+            .intersection(&brute_force(right, fixture))
             .copied()
             .collect(),
-        Expr::Or(left, right) => brute_force(left, reference)
-            .union(&brute_force(right, reference))
+        Expr::Or(left, right) => brute_force(left, fixture)
+            .union(&brute_force(right, fixture))
             .copied()
             .collect(),
-        Expr::Not(left, right) => brute_force(left, reference)
-            .difference(&brute_force(right, reference))
+        Expr::Not(left, right) => brute_force(left, fixture)
+            .difference(&brute_force(right, fixture))
             .copied()
             .collect(),
-        Expr::Phrase(_) | Expr::Near { .. } | Expr::Prefix(_) => {
-            unreachable!("days 9 to 11")
-        }
+        Expr::Near { .. } | Expr::Prefix(_) => unreachable!("days 10 and 11"),
     }
+}
+
+/// Every document's terms in order, with `None` marking the title/body join.
+///
+/// The join has to be represented, not elided: `FIELD_GAP` exists so that the
+/// last word of a title and the first of a body are not adjacent, and a
+/// reference that ran them together would disagree with the engine on exactly
+/// the case the gap was introduced for. A sentinel no real term can equal is
+/// the simplest way to say "these two are not neighbours".
+type Words = Vec<Vec<Option<String>>>;
+
+fn words_of(documents: &[Document]) -> Words {
+    documents
+        .iter()
+        .map(|document| {
+            let title = tokenize(&document.title).map(|t| Some(t.normalized().into_owned()));
+            let body = tokenize(&document.body).map(|t| Some(t.normalized().into_owned()));
+            title.chain(std::iter::once(None)).chain(body).collect()
+        })
+        .collect()
+}
+
+/// The documents where `phrase` appears as consecutive words.
+///
+/// `windows` over a flat list. Quadratic, allocating, and incapable of being
+/// subtly wrong about a prefix sum.
+fn brute_force_phrase(phrase: &[String], words: &Words) -> BTreeSet<DocId> {
+    let wanted: Vec<Option<String>> = phrase.iter().cloned().map(Some).collect();
+
+    words
+        .iter()
+        .enumerate()
+        .filter(|(_, document)| {
+            !wanted.is_empty()
+                && document.len() >= wanted.len()
+                && document
+                    .windows(wanted.len())
+                    .any(|window| window == &wanted[..])
+        })
+        .map(|(nth, _)| DocId::new(u32::try_from(nth).expect("small fixture")))
+        .collect()
 }
 
 struct Fixture {
     index: Index,
     reference: Reference,
+    words: Words,
     vocabulary: Vec<String>,
+    /// Word sequences that really occur in the fixture, 2 to 5 words long.
+    ///
+    /// A phrase strategy built only from random vocabulary words would match
+    /// nothing, and an evaluator that always returned nothing would pass. These
+    /// are drawn out of the documents themselves, so roughly half the generated
+    /// phrases have an answer to get wrong.
+    ngrams: Vec<Vec<String>>,
+}
+
+fn ngrams_of(words: &Words) -> Vec<Vec<String>> {
+    let mut ngrams = Vec::new();
+
+    for document in words {
+        for length in 2..=5 {
+            for window in document.windows(length) {
+                // A window containing the title/body sentinel is not a phrase
+                // that occurs — which is exactly the case worth generating.
+                if let Some(phrase) = window.iter().cloned().collect::<Option<Vec<String>>>() {
+                    ngrams.push(phrase);
+                }
+            }
+        }
+    }
+
+    ngrams.sort();
+    ngrams.dedup();
+    ngrams
 }
 
 /// Built once, because building it twenty-thousand times for proptest would
@@ -109,10 +183,15 @@ static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
     let reference = reference_of(&documents);
     let vocabulary = reference.keys().cloned().collect();
 
+    let words = words_of(&documents);
+    let ngrams = ngrams_of(&words);
+
     Fixture {
         index: index_of(&documents),
         reference,
+        words,
         vocabulary,
+        ngrams,
     }
 });
 
@@ -120,9 +199,7 @@ static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
 /// when they do not.
 fn agree(expression: &Expr) {
     let found = evaluate(expression, &FIXTURE.index).expect("no unsupported operators");
-    let expected: Vec<DocId> = brute_force(expression, &FIXTURE.reference)
-        .into_iter()
-        .collect();
+    let expected: Vec<DocId> = brute_force(expression, &FIXTURE).into_iter().collect();
 
     assert_eq!(found, expected, "{expression}");
 }
@@ -212,6 +289,89 @@ fn every_hit_really_contains_every_required_term() {
     }
 }
 
+#[test]
+fn the_day_nine_acceptance_phrases_return_the_right_documents() {
+    // `docs/PLAN.md` asks for phrases of 2, 3 and 5 terms and a near miss.
+    for query in [
+        "'quantum chromodynamics'",
+        "'error correction'",
+        "'surface code quantum error correction'",
+        "'perturbative quantum chromodynamics'",
+        "'edge-disjoint spanning trees'",
+        "'quantum error correction at threshold'",
+        // Right words, wrong order.
+        "'chromodynamics quantum'",
+        "'correction error'",
+        // Words that all occur, never adjacent.
+        "'quantum trees'",
+        // A word the fixture has never seen.
+        "'quantum flurbles'",
+    ] {
+        agree(&parse(query).expect("valid query"));
+    }
+
+    // Two of those must actually find something, or the test proves nothing.
+    let hits = |query: &str| {
+        evaluate(&parse(query).expect("valid query"), &FIXTURE.index).expect("supported")
+    };
+    assert!(!hits("'quantum chromodynamics'").is_empty());
+    assert!(!hits("'surface code quantum error correction'").is_empty());
+    assert!(hits("'chromodynamics quantum'").is_empty());
+    assert!(hits("'quantum trees'").is_empty());
+}
+
+#[test]
+fn a_phrase_is_narrower_than_the_conjunction_of_its_words() {
+    // Not a tautology worth skipping: it is the property that would break if
+    // the positional stage were accidentally a no-op, and it would break
+    // silently, because every count would still look plausible.
+    for words in [
+        "quantum chromodynamics",
+        "error correction",
+        "spanning trees",
+    ] {
+        let phrase = parse(&format!("'{words}'")).expect("valid query");
+        let conjunction = parse(words).expect("valid query");
+
+        let phrase_hits = evaluate(&phrase, &FIXTURE.index).expect("supported");
+        let conjunction_hits = evaluate(&conjunction, &FIXTURE.index).expect("supported");
+
+        assert!(!phrase_hits.is_empty(), "{words}");
+        assert!(phrase_hits.len() <= conjunction_hits.len(), "{words}");
+        assert!(
+            phrase_hits.iter().all(|doc| conjunction_hits.contains(doc)),
+            "{words}"
+        );
+    }
+}
+
+#[test]
+fn a_phrase_never_spans_the_title_body_join() {
+    // Derived from the fixture rather than hard-coded: for every document, the
+    // last word of the title followed by the first word of the body is a phrase
+    // that must not match that document. `FIELD_GAP` is the only thing stopping
+    // it, and nothing else in the suite would notice if the gap were removed.
+    let mut checked = 0;
+
+    for (nth, document) in FIXTURE.words.iter().enumerate() {
+        let join = document.iter().position(Option::is_none).expect("sentinel");
+        let (Some(Some(last)), Some(Some(first))) =
+            (document.get(join.wrapping_sub(1)), document.get(join + 1))
+        else {
+            continue;
+        };
+
+        let straddling = Expr::Phrase(vec![last.clone(), first.clone()]);
+        let found = evaluate(&straddling, &FIXTURE.index).expect("supported");
+        let doc = DocId::new(u32::try_from(nth).expect("small fixture"));
+
+        assert!(!found.contains(&doc), "doc {nth}: {last:?} {first:?}");
+        checked += 1;
+    }
+
+    assert!(checked >= 15, "only checked {checked} documents");
+}
+
 /// A random query tree over terms the fixture actually contains.
 ///
 /// Drawing from the real vocabulary rather than random strings is the point:
@@ -220,18 +380,44 @@ fn every_hit_really_contains_every_required_term() {
 fn any_expression() -> impl Strategy<Value = Expr> {
     let terms = FIXTURE.vocabulary.clone();
 
-    prop::sample::select(terms)
-        .prop_map(Expr::Term)
-        .prop_recursive(4, 24, 2, |inner| {
-            prop_oneof![
-                (inner.clone(), inner.clone())
-                    .prop_map(|(left, right)| Expr::And(Box::new(left), Box::new(right))),
-                (inner.clone(), inner.clone())
-                    .prop_map(|(left, right)| Expr::Or(Box::new(left), Box::new(right))),
-                (inner.clone(), inner)
-                    .prop_map(|(left, right)| Expr::Not(Box::new(left), Box::new(right))),
-            ]
-        })
+    prop_oneof![
+        3 => prop::sample::select(terms).prop_map(Expr::Term),
+        2 => any_phrase(),
+    ]
+    .prop_recursive(4, 24, 2, |inner| {
+        prop_oneof![
+            (inner.clone(), inner.clone())
+                .prop_map(|(left, right)| Expr::And(Box::new(left), Box::new(right))),
+            (inner.clone(), inner.clone())
+                .prop_map(|(left, right)| Expr::Or(Box::new(left), Box::new(right))),
+            (inner.clone(), inner)
+                .prop_map(|(left, right)| Expr::Not(Box::new(left), Box::new(right))),
+        ]
+    })
+}
+
+/// A random phrase, half of them real and half of them made up.
+///
+/// The real ones come out of the documents, so they have hits and the engine
+/// has something to get wrong. The shuffled and assembled ones mostly have no
+/// hits — which is the other half of the job, since a phrase search that
+/// matched its words in any order would sail through the first kind.
+fn any_phrase() -> impl Strategy<Value = Expr> {
+    let ngrams = FIXTURE.ngrams.clone();
+    let terms = FIXTURE.vocabulary.clone();
+
+    prop_oneof![
+        // Really occurs somewhere.
+        2 => prop::sample::select(ngrams.clone()).prop_map(Expr::Phrase),
+        // Really occurs, reversed: usually a near miss, occasionally a
+        // palindrome that still matches, and the reference decides which.
+        1 => prop::sample::select(ngrams).prop_map(|mut words| {
+            words.reverse();
+            Expr::Phrase(words)
+        }),
+        // Assembled from real words that were probably never neighbours.
+        1 => prop::collection::vec(prop::sample::select(terms), 2..=4).prop_map(Expr::Phrase),
+    ]
 }
 
 proptest! {
@@ -245,8 +431,20 @@ proptest! {
     #[test]
     fn any_boolean_query_agrees_with_brute_force(expression in any_expression()) {
         let found = evaluate(&expression, &FIXTURE.index).expect("no unsupported operators");
-        let expected: Vec<DocId> =
-            brute_force(&expression, &FIXTURE.reference).into_iter().collect();
+        let expected: Vec<DocId> = brute_force(&expression, &FIXTURE).into_iter().collect();
+
+        prop_assert_eq!(&found, &expected, "{}", expression);
+    }
+
+    /// Phrases specifically, against the flat-`windows` reference.
+    ///
+    /// Separate from the tree property above so that a failure says whether the
+    /// positional stage or the Boolean one is wrong, and so the generator can
+    /// lean hard on phrases that really occur.
+    #[test]
+    fn any_phrase_agrees_with_a_flat_window_scan(expression in any_phrase()) {
+        let found = evaluate(&expression, &FIXTURE.index).expect("phrases work");
+        let expected: Vec<DocId> = brute_force(&expression, &FIXTURE).into_iter().collect();
 
         prop_assert_eq!(&found, &expected, "{}", expression);
     }

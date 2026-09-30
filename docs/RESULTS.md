@@ -428,3 +428,119 @@ harness needs its query set drawn from the real corpus's own frequency
 distribution, or the percentiles it reports will describe a corpus nobody has.
 Both numbers stay in this file: 220 µs is what a user gets, 17 ms is the
 ceiling when every clause is common.
+
+## Day 9 — Phrase queries
+
+**The corpus changed for this section, and day 8's numbers do not carry over.**
+Day 8's addendum found the synthetic corpus 77× too common at the tail; it also
+drew every token independently, so no two-word sequence ever recurred and a
+phrase query had nothing to find. Both are fixed:
+
+| | v1 (day 8) | v2 (day 9) | Real arXiv |
+| --- | --- | --- | --- |
+| `quantum` | 68.1% | **11.03%** | 11.33% |
+| `entanglement` | 54.3% | **1.05%** | 1.41% |
+| Recurring two-word sequences | none | yes | yes |
+
+v2 assembles each document from four-word chunks drawn from their own Zipf
+distribution, so a common phrase is common and a rare one is rare. Word ranks
+are now solved for a target document frequency rather than picked by hand.
+
+1,000,000 documents, 46,884 terms, 112.2M postings, 160M positions, 1.4 GiB
+index, 56.0 s to build.
+
+### Getting the chunk ranks wrong is instructive
+
+The first run of the v2 generator gave `quantum` a document frequency of 66%
+even though its word rank had been solved for 11%. The cause: a planted chunk at
+Zipf rank 3. A chunk at rank *r* lands in roughly `40/(r·H)` of documents, so
+rank 3 puts all four of its words in 69% of the corpus, and `quantum` inherited
+that instead of its own rank. A planted phrase has to be as rare as the phrase
+it stands for.
+
+### Phrase latency, and what the positional stage costs
+
+| Query | Hits | Latency |
+| --- | --- | --- |
+| `'quantum chromodynamics'` | 4,029 | 954 µs |
+| `quantum AND chromodynamics` | 4,717 | 849 µs |
+| `'quantum entanglement'` | 5,067 | 1.15 ms |
+| `quantum AND entanglement` | 5,608 | 450 µs |
+| `'error correction'` | 19,683 | 1.93 ms |
+| `error AND correction` | 19,716 | 452 µs |
+| `'surface code quantum error'` | 1,005 | 1.97 ms |
+| `surface AND code AND quantum AND error` | 1,036 | 1.24 ms |
+| `'chromodynamics quantum'` (reversed) | 0 | 948 µs |
+| `'the of and in we'` | 0 | 352 ms |
+
+**A phrase costs 1.1–4× the `AND` of the same words.** Stage one *is* that
+`AND`; the extra is stage two reading position lists in the documents that
+survived it. `'error correction'` is the worst ratio at 4.3× and the smallest
+filter — 19,683 of 19,716 co-occurrences are adjacent — because in this corpus
+`correction` only ever appears in a chunk where `error` precedes it. Real text
+is not that obliging; `'quantum chromodynamics'` drops 688 of 4,717 (15%).
+
+**The reversed phrase costs the same and returns nothing.**
+`'chromodynamics quantum'` is 948 µs against 954 µs for the forward phrase. It
+finds the same 4,717 co-occurring documents and rejects every one. That is the
+price of correctness, and it is not avoidable: nothing in a document list says
+which order the words are in.
+
+**Five stop words in a row is the worst case, at 352 ms.**
+`'the of and in we'` survives stage one in ~800,000 documents and has to read
+five position lists in each. It is 370× slower than a phrase of content words
+and returns nothing. A stop-word list would make it disappear, and this engine
+deliberately has none — dropping `the` would break `"to be or not to be"`.
+Day 13 can revisit it; the honest number belongs here either way.
+
+### Why the anchor is the rarest word *in the document*
+
+Inside a document, the positional check tests one alignment per occurrence of
+the anchor word. Choosing which word to anchor on therefore depends on how
+often each repeats — not in the corpus, but in that one document:
+
+| Term | Documents | Mean occurrences per document | p50 | p95 | max |
+| --- | --- | --- | --- | --- | --- |
+| `the` | 980,436 | 4.25 | 4 | 8 | 18 |
+| `of` | 864,072 | 2.30 | 2 | 5 | 12 |
+| `we` | 653,157 | 1.61 | 1 | 3 | 8 |
+| `quantum` | 110,257 | 1.06 | 1 | 2 | 4 |
+| `theory` | 35,911 | 1.02 | 1 | 1 | 3 |
+| `entanglement` | 10,482 | 1.01 | 1 | 1 | 3 |
+| `chromodynamics` | 10,242 | 1.00 | 1 | 1 | 2 |
+
+Content words occur once. Stop words occur four to eighteen times. So the
+anchor choice can only matter for a phrase that mixes the two — which is
+exactly what the measurement shows. Best of five runs, against the same binary
+with `min_by_key` replaced by "always anchor on the first word":
+
+| Query | Rarest-word anchor | First-word anchor | |
+| --- | --- | --- | --- |
+| `'the quantum'` | **17 ms** | 24 ms | 1.41× |
+| `'the quantum theory'` | **11 ms** | 12 ms | 1.12× |
+| `'quantum chromodynamics'` | 984 µs | 987 µs | 1.00× |
+| `'the of and in we'` | 320 ms | 328 ms | 1.03× |
+
+It pays where one word repeats and another does not, it is a wash where every
+word repeats equally, and it never loses. One line — `min_by_key` instead of
+`[0]` — for 1.4× on the queries people actually write, since a phrase in prose
+usually starts with an article.
+
+### Correctness
+
+221 tests. Phrases get a second reference implementation, blunter than day 8's:
+each document's terms flattened into one `Vec<Option<String>>` with `None`
+marking the title/body join, searched with `windows(k)`. It knows nothing about
+positions, postings or `FIELD_GAP` — it looks for the words next to each other
+the way a reader would.
+
+The property test generates phrases three ways: sequences lifted out of the
+documents (so roughly half have hits), those same sequences reversed (near
+misses, and the occasional palindrome the reference has to adjudicate), and
+sequences assembled from real words that were probably never neighbours. A
+phrase search that ignored order would pass on the first kind alone.
+
+One test is derived rather than written: for every document, the last word of
+the title followed by the first word of the body is a phrase that must not
+match that document. `FIELD_GAP` is the only thing preventing it, and nothing
+else in the suite would notice if the gap were removed.

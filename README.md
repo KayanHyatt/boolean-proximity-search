@@ -50,9 +50,9 @@ on the full set.
 | `a ONEAR/3 b` | within 3 positions, `a` first |
 | `comp*` | prefix wildcard |
 
-`AND`, `OR`, `NOT`, grouping and the implicit `AND` **work today**. Phrases,
-`NEAR`/`ONEAR` and prefix wildcards parse correctly and report
-`not implemented yet` — days 9 to 11 of the plan fill them in.
+`AND`, `OR`, `NOT`, grouping, the implicit `AND` and `"exact phrase"` **work
+today**. `NEAR`/`ONEAR` and prefix wildcards parse correctly and report
+`not implemented yet` — days 10 and 11 of the plan fill them in.
 
 Operators are **uppercase only**, so `cats and dogs` searches for the word
 "and" rather than silently becoming an operator.
@@ -97,9 +97,15 @@ the planner intersects them, and the hits:
   151,914 document(s), 15.1914% of the corpus, in 17 ms
 ```
 
-Intersecting the rarest list first is worth 935× on a three-clause query, and
+A phrase runs in two stages: intersect the words' document lists, then read
+positions only in the documents that survive. Inside a document the check
+anchors on whichever word occurs fewest times there, since content words occur
+once and articles four to eighteen times.
+
+Intersecting the rarest list first is worth 935× on a three-clause query,
 skipping ahead by exponential search instead of stepping is worth up to 800×
-when one list is far shorter than the other. Both are measured in
+when one list is far shorter than the other, and anchoring a phrase on its
+rarest word is worth 1.4× on `'the quantum'`. All measured in
 [`docs/RESULTS.md`](docs/RESULTS.md).
 
 ## License
