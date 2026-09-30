@@ -509,9 +509,10 @@ often each repeats — not in the corpus, but in that one document:
 | `entanglement` | 10,482 | 1.01 | 1 | 1 | 3 |
 | `chromodynamics` | 10,242 | 1.00 | 1 | 1 | 2 |
 
-Content words occur once. Stop words occur four to eighteen times. So the
-anchor choice can only matter for a phrase that mixes the two — which is
-exactly what the measurement shows. Best of five runs, against the same binary
+Content words occur once. Stop words occur four to eighteen times. So on *this*
+corpus the anchor choice can only matter for a phrase that mixes the two —
+which is exactly what the measurement below shows. Real arXiv does not agree,
+and the day 9 addendum says why it matters. Best of five runs, against the same binary
 with `min_by_key` replaced by "always anchor on the first word":
 
 | Query | Rarest-word anchor | First-word anchor | |
@@ -598,3 +599,34 @@ rarest word, because that is exactly what `estimate` gives the planner:
 
 The header only appears when there is more than one leaf; a single-term or
 single-phrase query has no plan to show.
+
+### And one conclusion above is wrong
+
+The repetition table says content words occur once per document, and concludes
+that anchoring on the rarest word can only matter for phrases mixing a content
+word with an article. Real abstracts say otherwise. From one screen of hits:
+
+```
+  0705.2342   Continuous quantum error correction for non-Markovian decoherence
+              quantum×2 error×7 correction×8
+  0705.4128   System Design for a Long-Line Quantum Repeater
+              quantum×12 error×1 correction×1
+  0706.3400   Channel-Adapted Quantum Error Correction
+              quantum×7 error×5 correction×2
+```
+
+`quantum×12`, `correction×8`, `error×7` — content words, in the documents that
+actually match, repeating as often as `the` does in the synthetic corpus. A
+paper about quantum error correction says "quantum error correction" a dozen
+times. So the anchor choice applies to ordinary content phrases too, and the 1×
+figure is an artefact of the generator: assembling documents from independently
+drawn chunks spreads a word's occurrences *across* documents instead of
+concentrating them *within* one, which is the opposite of how a real document
+about a subject behaves.
+
+Third finding in three days about the same generator, and the one that matters
+most for day 12: a benchmark built on it would understate every positional cost,
+because positional work is proportional to occurrences per document and the
+generator produces a third to a twelfth of the real number. Before day 12's
+percentiles mean anything, documents need topic coherence — draw each document's
+chunks from a small subset of the pool rather than the whole of it.
