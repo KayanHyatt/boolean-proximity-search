@@ -9,8 +9,8 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use boolsearch::{
-    DocStore, Document, Error, Expr, IndexBuilder, JsonlCorpus, Result, SearchIndex, evaluate,
-    parse,
+    DocStore, Document, Error, Expr, IndexBuilder, JsonlCorpus, Result, SearchIndex, TermId,
+    evaluate, parse,
 };
 use clap::{Parser, Subcommand};
 
@@ -310,31 +310,59 @@ fn search_index(query: &str, path: &Path, limit: usize) -> Result<()> {
     println!();
     println!("  {expression}");
 
-    // Every distinct term in the query with the number of documents it appears
-    // in — the only numbers the planner gets to look at, and the reason it
-    // intersects in this order rather than the written one.
-    let mut frequencies: Vec<(String, usize)> = Vec::new();
-    expression.walk(&mut |node| {
-        if let Expr::Term(term) = node {
-            if !frequencies.iter().any(|(seen, _)| seen == term) {
-                let documents = bundle
-                    .index
-                    .term_id(term)
-                    .map_or(0, |id| bundle.index.document_frequency(id));
-                frequencies.push((term.clone(), documents));
+    // What the planner gets to look at: one line per leaf of the query, with a
+    // bound on how many documents it can match. A bare term's bound is its
+    // document frequency; a phrase's is the document frequency of its rarest
+    // word, since a phrase cannot occur anywhere all of its words do not.
+    // These numbers, and nothing else, decide the intersection order.
+    let mut leaves: Vec<(String, usize)> = Vec::new();
+    // Every distinct term anywhere in the query, phrases included, for the
+    // per-document occurrence counts printed under each hit.
+    let mut terms: Vec<(String, TermId)> = Vec::new();
+
+    let frequency = |term: &str| {
+        bundle
+            .index
+            .term_id(term)
+            .map_or(0, |id| bundle.index.document_frequency(id))
+    };
+    let remember = |term: &String, terms: &mut Vec<(String, TermId)>| {
+        if let Some(id) = bundle.index.term_id(term) {
+            if !terms.iter().any(|(seen, _)| seen == term) {
+                terms.push((term.clone(), id));
             }
         }
-    });
-    frequencies.sort_by_key(|&(_, documents)| documents);
+    };
 
-    if !frequencies.is_empty() {
+    expression.walk(&mut |node| match node {
+        Expr::Term(term) => {
+            remember(term, &mut terms);
+            if !leaves.iter().any(|(seen, _)| seen == term) {
+                leaves.push((term.clone(), frequency(term)));
+            }
+        }
+        Expr::Phrase(words) => {
+            for word in words {
+                remember(word, &mut terms);
+            }
+            let label = format!("\"{}\"", words.join(" "));
+            let bound = words.iter().map(|word| frequency(word)).min().unwrap_or(0);
+            if !leaves.iter().any(|(seen, _)| *seen == label) {
+                leaves.push((label, bound));
+            }
+        }
+        Expr::Prefix(_) | Expr::Near { .. } | Expr::And(..) | Expr::Or(..) | Expr::Not(..) => {}
+    });
+    leaves.sort_by_key(|&(_, bound)| bound);
+
+    if leaves.len() > 1 {
         println!();
-        println!("  terms, rarest first — the order the planner intersects in:");
-        for (term, documents) in &frequencies {
+        println!("  narrowest first — the order the planner intersects in:");
+        for (leaf, bound) in &leaves {
             println!(
-                "    {:<24} {:>12}",
-                truncate(term, 24),
-                format_count(*documents as f64)
+                "    {:<34} {:>12}",
+                truncate(leaf, 34),
+                format_count(*bound as f64)
             );
         }
     }
@@ -363,21 +391,20 @@ fn search_index(query: &str, path: &Path, limit: usize) -> Result<()> {
 
         println!("  {external:<12} {}", truncate(title, 62));
 
-        // Where the query's terms actually land. Not needed to answer the
-        // query, but it is the positional data day 9's phrase search will
-        // depend on, so being able to see it now is worth six lines.
+        // How often each of the query's words occurs in this document. Not
+        // needed to answer the query, but it is the positional data phrase and
+        // proximity search run on, so being able to see it is worth six lines.
         let mut occurrences = String::new();
-        for (term, _) in &frequencies {
-            let Some(id) = bundle.index.term_id(term) else {
+        for (term, id) in &terms {
+            let Ok(nth) = bundle.index.doc_ids(*id).binary_search(&doc_id) else {
                 continue;
             };
-            let Ok(nth) = bundle.index.doc_ids(id).binary_search(&doc_id) else {
-                continue;
-            };
-            let positions = bundle.index.positions(id, nth);
-            occurrences.push_str(&format!(" {term}×{}", positions.len()));
+            let count = bundle.index.positions(*id, nth).len();
+            occurrences.push_str(&format!(" {term}×{count}"));
         }
-        println!("  {:<12}{occurrences}", "");
+        if !occurrences.is_empty() {
+            println!("  {:<12}{occurrences}", "");
+        }
     }
 
     if matches.len() > limit {

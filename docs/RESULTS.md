@@ -544,3 +544,57 @@ One test is derived rather than written: for every document, the last word of
 the title followed by the first word of the body is a phrase that must not
 match that document. `FIELD_GAP` is the only thing preventing it, and nothing
 else in the suite would notice if the gap were removed.
+
+### Day 9 addendum — real corpus, real hardware
+
+Kayan's laptop, 500,000 arXiv records.
+
+| Query | Hits | % | Latency |
+| --- | --- | --- | --- |
+| `'error correction'` | 674 | 0.135% | **174 µs** |
+| `'surface code quantum error correction'` | 2 | 0.0004% | **187 µs** |
+| `'correction error'` (reversed) | 3 | 0.0006% | **141 µs** |
+| `quantum AND 'error correction' NOT classical` | 331 | 0.066% | **199 µs** |
+
+Eleven times faster than the synthetic corpus again, and for the same reason as
+day 8: real vocabulary is far steeper at the tail, so stage one hands stage two
+hundreds of documents rather than twenty thousand. The five-word phrase is *no
+slower* than the two-word one — 187 µs against 174 µs — because each extra word
+narrows stage one more than it adds to stage two.
+
+**The reversed phrase was supposed to return nothing, and it returned three
+documents. It is right and the prediction was wrong.** One of them is
+0806.2782, *"Another Correction. Error estimates for Binomial approximation…"*.
+The tokenizer splits on the full stop, so `correction` and `error` are adjacent
+positions with a sentence boundary between them that the index does not record.
+
+That is a real limitation, not a bug in phrase search.
+[`FIELD_GAP`](../src/index.rs) keeps a phrase from spanning the title/body join;
+nothing keeps one from spanning a sentence. Fixing it would mean emitting a gap
+at sentence boundaries during tokenization, which changes every position in the
+index and therefore the on-disk format. Noting it here rather than doing it:
+plenty of production engines behave exactly this way, the cost of the fix is a
+full reindex, and day 10's `NEAR/k` deliberately crosses sentence boundaries
+anyway — `a NEAR/5 b` is a question about a window of text, not a sentence.
+
+### Output: showing the plan, not just the terms
+
+Kayan's first run exposed a display bug worth the fix. The per-hit occurrence
+line was built from `Expr::Term` nodes only, so a phrase-only query printed an
+empty line under every hit — a phrase contains no bare terms. The plan summary
+had the same blind spot: `quantum AND 'error correction' NOT classical` listed
+`quantum` and `classical` and said nothing about the phrase, which is the
+narrowest branch and the one the planner starts from.
+
+Both now walk into phrases. A phrase is listed as one leaf, bounded by its
+rarest word, because that is exactly what `estimate` gives the planner:
+
+```
+  narrowest first — the order the planner intersects in:
+    "error correction"                       21,533
+    classical                                28,472
+    quantum                                 110,257
+```
+
+The header only appears when there is more than one leaf; a single-term or
+single-phrase query has no plan to show.
