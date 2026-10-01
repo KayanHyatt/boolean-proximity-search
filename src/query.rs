@@ -514,6 +514,30 @@ impl Expr {
         }
     }
 
+    /// Whether this expression can say *where* in a document it matched.
+    ///
+    /// `NEAR` is a question about distance, so both of its operands have to
+    /// answer it. A term can — the index stores its positions. A phrase can:
+    /// its match occupies a known stretch of them. `OR` can, if both sides
+    /// can, by taking whichever matched. A nested `NEAR` can, by taking the
+    /// stretch spanning the pair it found.
+    ///
+    /// `AND` and `NOT` cannot, and not because of a missing feature. There is
+    /// no position at which `quantum AND gravity` occurs: it is a fact about a
+    /// whole document, not about a place in one. So
+    /// `(quantum AND gravity) NEAR/5 loop` has no meaning to implement, and
+    /// [`parse`] rejects it rather than inventing one.
+    #[must_use]
+    pub fn is_positional(&self) -> bool {
+        match self {
+            Self::Term(_) | Self::Prefix(_) | Self::Phrase(_) => true,
+            Self::Or(left, right) | Self::Near { left, right, .. } => {
+                left.is_positional() && right.is_positional()
+            }
+            Self::And(..) | Self::Not(..) => false,
+        }
+    }
+
     /// How many nodes the tree holds.
     #[must_use]
     pub fn size(&self) -> usize {
@@ -521,6 +545,30 @@ impl Expr {
         self.walk(&mut |_| count += 1);
         count
     }
+}
+
+/// Rejects a `NEAR` operand that cannot say where it matched.
+fn require_positional(expression: &Expr, span: Span, operator: &str) -> Result<()> {
+    if expression.is_positional() {
+        return Ok(());
+    }
+
+    let culprit = match expression {
+        Expr::And(..) => "AND",
+        Expr::Not(..) => "NOT",
+        // An `OR` whose own operand is non-positional; name the operator the
+        // user can actually see at fault.
+        _ => "AND or NOT",
+    };
+
+    Err(query_error(
+        span,
+        // Deliberately one line: `cargo fmt` will collapse a backslash
+        // continuation inside a string literal and leave its indentation in
+        // the message, which is how this one first read "does not have one
+        // —              it answers".
+        format!("{operator} needs to know where its operands matched, and {culprit} cannot say"),
+    ))
 }
 
 /// Parses a query into an [`Expr`].
@@ -628,12 +676,27 @@ impl Parser<'_> {
     }
 
     /// `near := primary ( NEAR/k primary )*`
+    ///
+    /// The one rule the grammar alone cannot express: a `NEAR` operand has to
+    /// be positional. `primary` allows a parenthesized group, and a group can
+    /// hold `AND` or `NOT`, so `(a AND b) NEAR/3 c` parses perfectly well and
+    /// means nothing. Catching it here rather than at evaluation is worth the
+    /// extra bookkeeping, because here the spans still exist and the error can
+    /// underline the offending group.
     fn parse_near(&mut self, context: &str) -> Result<Expr> {
+        let opened = self.position;
         let mut left = self.parse_primary(context)?;
+        let mut left_span = self.span_since(opened);
 
         while let Some((distance, ordered)) = self.eat_near() {
             let operator = if ordered { "ONEAR" } else { "NEAR" };
+            require_positional(&left, left_span, operator)?;
+
+            let opened = self.position;
             let right = self.parse_primary(operator)?;
+            require_positional(&right, self.span_since(opened), operator)?;
+
+            left_span = Span::new(left_span.start, self.span_since(opened).end);
             left = Expr::Near {
                 left: Box::new(left),
                 right: Box::new(right),
@@ -705,6 +768,25 @@ impl Parser<'_> {
         self.lexemes.get(self.position)
     }
 
+    /// The span covering every lexeme consumed since position `opened`.
+    ///
+    /// The AST carries no spans — it does not need them, and threading them
+    /// through every node to serve one error message would be a poor trade.
+    /// The lexemes do carry them, and the parser knows which ones it ate.
+    fn span_since(&self, opened: usize) -> Span {
+        let start = self
+            .lexemes
+            .get(opened)
+            .map_or(self.end, |lexeme| lexeme.span.start);
+        let end = self
+            .position
+            .checked_sub(1)
+            .and_then(|last| self.lexemes.get(last))
+            .map_or(start, |lexeme| lexeme.span.end);
+
+        Span::new(start, end.max(start))
+    }
+
     fn at(&self, kind: &LexemeKind) -> bool {
         self.peek().is_some_and(|lexeme| &lexeme.kind == kind)
     }
@@ -742,7 +824,7 @@ impl Parser<'_> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{Lexeme, LexemeKind, Span, lex, point_at};
+    use super::{Lexeme, LexemeKind, Span, lex, parse, point_at};
     use crate::error::Error;
 
     /// The lexeme kinds, discarding spans.
@@ -1186,6 +1268,67 @@ mod tests {
         assert_eq!(tree("a NOT b"), "(a NOT b)");
         assert_eq!(tree("a AND b NOT c"), "((a AND b) NOT c)");
         assert_eq!(tree("a NOT b AND c"), "((a NOT b) AND c)");
+    }
+
+    #[test]
+    fn a_near_operand_that_has_no_position_is_rejected() {
+        // `primary` allows a parenthesized group and a group can hold `AND`,
+        // so the grammar admits this and the semantics do not.
+        for query in [
+            "(a AND b) NEAR/3 c",
+            "c NEAR/3 (a AND b)",
+            "(a NOT b) NEAR/3 c",
+            "a ONEAR/2 (b AND c)",
+            "((a OR b) AND c) NEAR/1 d",
+            "(a AND b) NEAR/3 (c AND d)",
+        ] {
+            let message = parse_message(query);
+            // Asserts the message names the operator that cannot be satisfied
+            // and the one at fault, rather than pinning its exact wording.
+            assert!(message.contains("NEAR"), "{query}: {message}");
+            assert!(
+                message.contains("AND") || message.contains("NOT"),
+                "{query}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rejection_underlines_the_group_at_fault() {
+        let query = "quantum AND (alpha AND beta) NEAR/3 gamma";
+        let Err(Error::Query { offset, length, .. }) = parse(query) else {
+            panic!("expected a query error");
+        };
+
+        assert_eq!(&query[offset..offset + length], "(alpha AND beta)");
+    }
+
+    #[test]
+    fn a_near_operand_that_does_have_a_position_is_accepted() {
+        // Everything positional, including the shapes that look suspicious.
+        for query in [
+            "(a OR b) NEAR/3 c",
+            "(\"a b\") NEAR/3 c",
+            "(a NEAR/1 b) NEAR/3 c",
+            "a NEAR/3 b NEAR/3 c",
+            "((a OR b) OR \"c d\") ONEAR/2 e",
+            "a* NEAR/3 b",
+        ] {
+            assert!(parse(query).is_ok(), "{query}: {}", parse_message(query));
+        }
+    }
+
+    #[test]
+    fn only_and_and_not_are_non_positional() {
+        assert!(parse("a").expect("valid").is_positional());
+        assert!(parse("\"a b\"").expect("valid").is_positional());
+        assert!(parse("a*").expect("valid").is_positional());
+        assert!(parse("a OR b").expect("valid").is_positional());
+        assert!(parse("a NEAR/2 b").expect("valid").is_positional());
+        assert!(!parse("a AND b").expect("valid").is_positional());
+        assert!(!parse("a NOT b").expect("valid").is_positional());
+        // An `OR` is only as positional as its operands.
+        assert!(!parse("a OR (b AND c)").expect("valid").is_positional());
     }
 
     #[test]

@@ -630,3 +630,139 @@ because positional work is proportional to occurrences per document and the
 generator produces a third to a twelfth of the real number. Before day 12's
 percentiles mean anything, documents need topic coherence — draw each document's
 chunks from a small subset of the pool rather than the whole of it.
+
+## Day 10 — NEAR/k proximity
+
+**The corpus changed again, deliberately.** Day 9's addendum ended with a
+prerequisite for day 12: documents had no topic coherence, so content words
+occurred 1.0 times per document against 7–12 in real arXiv, and any positional
+benchmark built on that would understate its own subject. Three of each
+document's forty chunk slots now go to three "topic" chunks that repeat between
+them, and the rest are drawn once:
+
+| Occurrences per document | v2 (day 9) | v3 (day 10) | Real arXiv |
+| --- | --- | --- | --- |
+| `quantum` — mean / p95 / max | 1.06 / 2 / 4 | **1.50 / 5 / 15** | up to 12 |
+| `correction` — mean / p95 / max | 1.01 / 1 / 3 | **1.44 / 5 / 14** | up to 8 |
+| `the` — mean / p95 / max | 4.25 / 8 / 18 | **5.02 / 13 / 39** | — |
+
+1,000,000 documents, 46,882 terms, 83.3M postings, 160M positions, 1.2 GiB
+index, 41.6 s to build. Fewer postings than v2 for the same 160M positions,
+which is the fix working: the same word occurring five times in one document is
+one posting with five positions, not five postings.
+
+### Latency
+
+| Query | Hits | Latency |
+| --- | --- | --- |
+| `quantum AND error` (baseline) | 4,512 | 783 µs |
+| `quantum NEAR/1 error` | 1,031 | 1.66 ms |
+| `'quantum error' OR 'error quantum'` | 1,031 | 2.47 ms |
+| `quantum NEAR/5 error` | 1,289 | 1.85 ms |
+| `quantum NEAR/20 error` | 2,051 | 1.68 ms |
+| `quantum NEAR/100 error` | 3,881 | 1.60 ms |
+| `quantum ONEAR/5 error` | 1,183 | 1.58 ms |
+| `'error correction' NEAR/5 surface` | 176 | 3.28 ms |
+| `(quantum NEAR/2 error) NEAR/4 threshold` | 0 | 1.60 ms |
+| `(quantum OR optical) NEAR/4 code` | 1,034 | 1.28 ms |
+| `quantum NEAR/3 flurbles` | 0 | 177 µs |
+| `the NEAR/3 of` | 395,077 | 215 ms |
+| `the AND of` | 905,426 | 7.68 ms |
+
+**`distance` does not appear in the cost.** NEAR/1 and NEAR/100 both run in
+about 1.6 ms while returning 1,031 and 3,881 documents. The work is stage one's
+document intersection plus one `partition_point` per extent, and neither
+depends on *k*: a wider window does not mean more candidates to examine, only a
+looser test on the ones already in hand. Widening the window is free, which is
+not what you would guess from the fact that it quadruples the answer.
+
+**`a NEAR/1 b` really is `"a b" OR "b a"`, and it is faster than writing it
+that way.** Identical answers — 1,031 documents — at 1.66 ms against 2.47 ms,
+because the phrase form evaluates two phrases and unions them while `NEAR` makes
+one pass and tests both directions per pair. That equivalence is also the test
+that pins the definition of `distance`: off by one in either direction and it
+breaks.
+
+**Ordered is cheaper than unordered, by about 15%.** 1.58 ms against 1.85 ms,
+and 198 ms against 215 ms on the stop-word pair. `ONEAR` pairs extents once;
+`NEAR` may have to pair them again the other way round. A first single-run
+measurement said the opposite, which is what best-of-five is for.
+
+**A phrase operand costs twice a term operand.** 3.28 ms for
+`'error correction' NEAR/5 surface`. Day 9's phrase filter walks a whole
+candidate list in order and can carry a forward-only cursor per word; inside a
+`NEAR` the documents arrive one at a time, so it pays a binary search per word
+per document instead. Day 13 could thread the cursors through.
+
+**The worst case is two stop words: 215 ms, 28× the conjunction.** `the NEAR/3
+of` has to read two position lists — averaging 5 and 4.4 entries, up to 39 — in
+each of 905,426 documents. There is nothing to skip: both words are everywhere.
+The honest comparison is that `the AND of` answers in 7.68 ms, so proximity is
+where a stop-word query stops being cheap.
+
+### Returning an iterator paid for itself twice
+
+Day 9's phrase search needed to know *whether* a phrase occurred; day 10's
+`NEAR` needs to know *where*. The obvious options were two functions, or one
+function with a `first_only: bool` that reads badly at every call site.
+
+`aligned_starts` returns `impl Iterator<Item = u32>` instead. Day 9's filter
+calls `.next().is_some()` and stops at the first alignment; day 10 collects all
+of them. One implementation of the fiddly part, no flag, and — the part worth
+noticing — **day 9 kept its early exit for free**, because `filter_map` is lazy.
+A `Vec`-returning version would have computed every alignment for every
+document just so day 9 could ask whether there was at least one.
+
+### What a NEAR operand may be is a semantic question, not a feature gap
+
+`primary` in the day-7 grammar allows a parenthesized group, and a group can
+hold `AND`. So `(quantum AND gravity) NEAR/5 loop` parses, and means nothing:
+there is no position at which `quantum AND gravity` occurs, because that is a
+fact about a whole document rather than a place in one.
+
+`Expr::is_positional` draws the line — `Term`, `Phrase`, `Prefix`, nested
+`Near`, and `Or` of those, but never `AND` or `NOT` — and `parse_near` enforces
+it:
+
+```
+$ boolsearch search "quantum AND (alpha AND beta) NEAR/3 gamma"
+error: invalid query at byte 12: NEAR needs to know where its operands matched, and AND cannot say
+
+  quantum AND (alpha AND beta) NEAR/3 gamma
+              ^^^^^^^^^^^^^^^^
+```
+
+Checking it in the parser rather than the evaluator costs a little bookkeeping
+— the AST has no spans, so `parse_near` records which lexemes each operand
+consumed — and buys an error that underlines the group at fault instead of one
+that names a type.
+
+That message was written as a backslash-continued string literal over two
+lines, and `cargo fmt` collapsed it into one while keeping the indentation, so
+the first run read *"does not have one —              it answers"*. Worth
+knowing: a continuation inside a string literal is not safe from the
+formatter.
+
+### Correctness
+
+242 tests. Proximity gets a third reference implementation: a
+`BTreeMap<String, Vec<u32>>` per document with the title/body offset re-derived
+rather than imported, and extents computed by nested loops over every pair — no
+sorting, no `partition_point`, no early exit, no anchor heuristic. It is the
+definition of `NEAR` typed out.
+
+Two properties are checked rather than examples:
+
+- **Monotonicity.** For each pair of terms, `NEAR/1` through `NEAR/12`, each
+  result must contain every document the narrower one found. A window bound
+  that was right at 3 and wrong at 4 would fail here and nowhere else.
+- **`ONEAR ⊆ NEAR`.** Every ordered match is an unordered one.
+
+And one test that keeps the references honest: the day-9 flat-`windows` phrase
+scan and the day-10 positional one must agree with each other on 400 real
+n-grams. Two independent references that disagreed would mean the property
+tests were checking against a coin flip.
+
+The `FIELD_GAP` test is behavioural rather than a constant read: with a
+two-word title, `beta NEAR/100 gamma` must find nothing and `beta NEAR/101
+gamma` must find the document. That pins the gap's value from the outside.

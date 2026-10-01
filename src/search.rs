@@ -48,12 +48,41 @@
 //! occur thirty times in an abstract and `gravity` twice, and anchoring on
 //! `gravity` means testing two alignments instead of thirty.
 //!
-//! Day 10 forces a design change worth anticipating: `("machine learning")
-//! NEAR/5 medical` means a `NEAR` *operand* must expose positions, not just
-//! documents, so a positional layer will have to sit alongside the document
-//! one. Day 9 does not need it — a phrase's operands are always plain terms,
-//! so a phrase reads positions straight out of the index and hands back
-//! documents like everything else.
+//! # Proximity
+//!
+//! Day 10 is the design change day 9 saw coming. `("machine learning") NEAR/5
+//! medical` asks how far apart two *matches* are, so a `NEAR` operand has to
+//! be able to say where it matched — and a phrase's match is not a point but a
+//! stretch, so the answer is an *extent*, a first and last position:
+//!
+//! ```text
+//!   ("machine learning") NEAR/5 medical
+//!
+//!   position  41 42 43 44 45 46 47 48
+//!             ├──────┤              │
+//!             machine learning      medical
+//!                    └── gap = 47 - 42 = 5 ──┘
+//! ```
+//!
+//! `distance` counts the gap between the end of one match and the start of the
+//! next, which for two bare terms is the conventional "positions differ by at
+//! most k" — and makes `a NEAR/1 b` exactly `"a b" OR "b a"`, a property worth
+//! a test. Overlapping matches do not count, so `a NEAR/3 a` needs two
+//! occurrences of `a` rather than pairing one with itself.
+//!
+//! The positional layer sits *alongside* the document one rather than
+//! replacing it. [`evaluate`] still answers with documents, because that is
+//! what a search result is; the positional layer answers with positions, and only
+//! `NEAR` ever asks. So the day-8 and day-9 code paths are untouched, and a
+//! query with no proximity in it pays nothing for this.
+//!
+//! What a `NEAR` operand may be is therefore not a matter of taste.
+//! `Term`, `Phrase`, `Prefix`, a nested `Near`, and `Or` of those all have
+//! positions. `AND` and `NOT` do not: there is no position at which
+//! `quantum AND gravity` occurs, because that is a fact about a document
+//! rather than a place in one. [`parse`](crate::parse) rejects
+//! `(quantum AND gravity) NEAR/5 loop` at parse time, where the spans still
+//! exist and the error can underline the group at fault.
 //!
 //! # Set operations as iterators
 //!
@@ -372,10 +401,9 @@ impl Iterator for Difference<'_> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::NotImplemented`] for the `NEAR` and prefix operators,
-/// which days 10 and 11 fill in. The check happens before any work, so a query
-/// using one fails the same way whether or not its other clauses match
-/// anything.
+/// Returns [`Error::NotImplemented`] for the prefix operator, which day 11
+/// fills in. The check happens before any work, so a query using one fails the
+/// same way whether or not its other clauses match anything.
 pub fn evaluate(expression: &Expr, index: &Index) -> Result<Vec<DocId>> {
     if let Some(feature) = unsupported(expression) {
         return Err(Error::NotImplemented(feature));
@@ -452,16 +480,22 @@ fn evaluate_branch(expression: &Expr, index: &Index) -> Result<Vec<DocId>> {
     match expression {
         Expr::Term(term) => Ok(term_docs(term, index).to_vec()),
         Expr::Phrase(terms) => Ok(evaluate_phrase(terms, index)),
+        Expr::Near {
+            left,
+            right,
+            distance,
+            ordered,
+        } => evaluate_near(left, right, *distance, *ordered, index),
         Expr::And(..) | Expr::Not(..) => evaluate_conjunction(expression, index),
         Expr::Or(left, right) => {
             let left = evaluate_branch(left, index)?;
             let right = evaluate_branch(right, index)?;
             Ok(union(&left, &right).collect())
         }
-        // Unreachable in practice: `evaluate` rejects these up front. Answered
+        // Unreachable in practice: `evaluate` rejects this up front. Answered
         // rather than panicked because a total function is one fewer thing to
-        // be careful about when days 10 and 11 rewrite this match.
-        Expr::Near { .. } | Expr::Prefix(_) => Err(Error::NotImplemented(
+        // be careful about when day 11 rewrites this match.
+        Expr::Prefix(_) => Err(Error::NotImplemented(
             unsupported(expression).unwrap_or("this operator"),
         )),
     }
@@ -605,31 +639,276 @@ fn phrase_occurs<'a>(
         positions.push(index.positions(term.id, term.nth));
     }
 
-    // Anchor on the term with the fewest occurrences here: every occurrence of
-    // it is one alignment to test, and every other term is then a lookup.
-    let Some(anchor) = (0..phrase.len()).min_by_key(|&slot| positions[slot].len()) else {
-        return false;
-    };
+    let offsets: Vec<u32> = phrase.iter().map(|term| term.offset).collect();
+    aligned_starts(&offsets, positions).next().is_some()
+}
 
-    for &occurrence in positions[anchor] {
+/// Every position at which a phrase begins, given where each of its words
+/// occurs in one document.
+///
+/// `offsets[i]` is word `i`'s place in the phrase and `positions[i]` is where
+/// that word occurs in the document, ascending. Returned as an iterator rather
+/// than a `Vec` so that one implementation serves both callers: day 9's
+/// document filter only needs to know whether there is a first element, and
+/// stops there, while day 10's `NEAR` needs all of them.
+///
+/// Anchors on whichever word has the fewest occurrences *in this document* —
+/// the planner's rarest-first idea one level down. A paper about quantum error
+/// correction says `correction` eight times and `the` thirty; anchoring on the
+/// rarer one means eight alignments to test instead of thirty.
+fn aligned_starts<'a>(
+    offsets: &'a [u32],
+    positions: &'a [&'a [u32]],
+) -> impl Iterator<Item = u32> + 'a {
+    let anchor = (0..positions.len())
+        .min_by_key(|&slot| positions[slot].len())
+        .unwrap_or(0);
+    let shift = offsets.get(anchor).copied().unwrap_or(0);
+    let occurrences: &[u32] = positions.get(anchor).copied().unwrap_or(&[]);
+
+    occurrences.iter().filter_map(move |&occurrence| {
         // If the anchor is the phrase's third word and it sits at position 7,
-        // the phrase would have to start at 5.
-        let Some(start) = occurrence.checked_sub(phrase[anchor].offset) else {
-            continue;
-        };
+        // the phrase would have to start at 5. Ascending occurrences give
+        // ascending starts, which is what the extent list relies on.
+        let start = occurrence.checked_sub(shift)?;
 
-        let aligned = phrase.iter().enumerate().all(|(slot, term)| {
-            positions[slot]
-                .binary_search(&start.saturating_add(term.offset))
-                .is_ok()
-        });
+        offsets
+            .iter()
+            .zip(positions)
+            .all(|(offset, list)| list.binary_search(&start.saturating_add(*offset)).is_ok())
+            .then_some(start)
+    })
+}
 
-        if aligned {
-            return true;
-        }
+// ---------------------------------------------------------------------------
+// Proximity
+// ---------------------------------------------------------------------------
+
+/// The stretch of positions one match occupies, both ends inclusive.
+///
+/// A term's match is one position wide. A phrase's is as wide as the phrase. A
+/// `NEAR` match spans from the start of whichever operand came first to the end
+/// of the other — which is what lets `(a NEAR/2 b) NEAR/5 c` mean anything:
+/// the inner match has edges, so the outer one can measure from them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Extent {
+    /// First position of the match.
+    start: u32,
+    /// Last position of the match, inclusive.
+    end: u32,
+}
+
+/// The documents where `left` and `right` match within `distance` positions.
+///
+/// Day 9's two-stage shape again, and for the same reason: find the documents
+/// where both sides match at all, which costs document-id comparisons, and only
+/// then read positions, which costs far more.
+///
+/// # Errors
+///
+/// Propagates [`Error::NotImplemented`] from an operand.
+fn evaluate_near(
+    left: &Expr,
+    right: &Expr,
+    distance: u32,
+    ordered: bool,
+    index: &Index,
+) -> Result<Vec<DocId>> {
+    let mut candidates = evaluate_branch(left, index)?;
+    if candidates.is_empty() {
+        return Ok(candidates);
     }
 
-    false
+    let other = evaluate_branch(right, index)?;
+    let narrowed: Vec<DocId> = intersect(&candidates, &other).collect();
+    candidates = narrowed;
+
+    // Reused across documents rather than allocated per document.
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+
+    candidates.retain(|&doc| {
+        first.clear();
+        second.clear();
+
+        extents_in(left, index, doc, &mut first)
+            && extents_in(right, index, doc, &mut second)
+            && (within(&first, &second, distance)
+                || (!ordered && within(&second, &first, distance)))
+    });
+
+    Ok(candidates)
+}
+
+/// Whether some extent of `first` is followed by one of `second`, no more than
+/// `distance` positions later.
+///
+/// # What `distance` counts
+///
+/// The gap between the end of one match and the start of the next, so for two
+/// bare terms `a NEAR/3 b` means their positions differ by at most 3 — the
+/// conventional reading — and `a NEAR/1 b` means adjacent, which makes
+/// `a NEAR/1 b` exactly `"a b" OR "b a"`. For a phrase the gap is measured from
+/// its nearest edge, since a phrase occupies a stretch rather than a point.
+///
+/// Overlapping matches do not count: `second` has to *begin after* `first`
+/// ends. That is deliberate rather than incidental — without it,
+/// `a NEAR/3 a` would match any document containing `a` once, by pairing the
+/// occurrence with itself.
+fn within(first: &[Extent], second: &[Extent], distance: u32) -> bool {
+    first.iter().any(|a| {
+        // `second` is sorted by start, so the first extent beginning after `a`
+        // ends is the closest one there is. If that one is too far, every later
+        // one is further still.
+        let next = second.partition_point(|b| b.start <= a.end);
+        second
+            .get(next)
+            .is_some_and(|b| b.start - a.end <= distance)
+    })
+}
+
+/// Appends, ascending, the extents at which `expression` matches inside `doc`.
+///
+/// Returns `false` for an expression that has no positions to report, leaving
+/// `out` as it found it. [`parse`](crate::parse) rejects those as `NEAR`
+/// operands, so in a parsed query this only fires for a prefix — day 11.
+fn extents_in(expression: &Expr, index: &Index, doc: DocId, out: &mut Vec<Extent>) -> bool {
+    let from = out.len();
+
+    match expression {
+        Expr::Term(term) => {
+            let Some(id) = index.term_id(term) else {
+                return true;
+            };
+            let Ok(nth) = index.doc_ids(id).binary_search(&doc) else {
+                return true;
+            };
+            out.extend(
+                index
+                    .positions(id, nth)
+                    .iter()
+                    .map(|&at| Extent { start: at, end: at }),
+            );
+            true
+        }
+
+        Expr::Phrase(terms) => {
+            phrase_extents_in(terms, index, doc, out);
+            true
+        }
+
+        Expr::Or(left, right) => {
+            if !extents_in(left, index, doc, out) || !extents_in(right, index, doc, out) {
+                out.truncate(from);
+                return false;
+            }
+            // Two ascending runs, concatenated. Sorting the tail is cheaper to
+            // write than a merge and the lists are a handful of entries long.
+            out[from..].sort_unstable();
+            dedup_from(out, from);
+            true
+        }
+
+        Expr::Near {
+            left,
+            right,
+            distance,
+            ordered,
+        } => {
+            if !extents_in(left, index, doc, out) {
+                out.truncate(from);
+                return false;
+            }
+            let middle = out.len();
+            if !extents_in(right, index, doc, out) {
+                out.truncate(from);
+                return false;
+            }
+
+            let mut paired = Vec::new();
+            {
+                let (head, tail) = out.split_at(middle);
+                pair(&head[from..], tail, *distance, &mut paired);
+                if !*ordered {
+                    pair(tail, &head[from..], *distance, &mut paired);
+                }
+            }
+
+            out.truncate(from);
+            paired.sort_unstable();
+            paired.dedup();
+            out.append(&mut paired);
+            true
+        }
+
+        // Day 11 will expand a prefix into its terms and union their positions.
+        Expr::Prefix(_) => false,
+        // No position exists to report; see `Expr::is_positional`.
+        Expr::And(..) | Expr::Not(..) => false,
+    }
+}
+
+/// Appends the extent of every `first`-then-`second` pair within `distance`.
+fn pair(first: &[Extent], second: &[Extent], distance: u32, out: &mut Vec<Extent>) {
+    for a in first {
+        let next = second.partition_point(|b| b.start <= a.end);
+        for b in &second[next..] {
+            if b.start - a.end > distance {
+                break;
+            }
+            out.push(Extent {
+                start: a.start,
+                end: b.end,
+            });
+        }
+    }
+}
+
+/// Removes consecutive duplicates from `out[from..]`, leaving the head alone.
+fn dedup_from(out: &mut Vec<Extent>, from: usize) {
+    let mut write = from;
+    for read in from..out.len() {
+        if write == from || out[write - 1] != out[read] {
+            out[write] = out[read];
+            write += 1;
+        }
+    }
+    out.truncate(write);
+}
+
+/// Appends, ascending, the extents at which the phrase `terms` occurs in `doc`.
+///
+/// The cursorless sibling of [`phrase_occurs`]. That one walks a whole
+/// candidate list in order and can carry a forward-only cursor per term; this
+/// one is handed one document at a time from inside a `NEAR`, so it pays a
+/// binary search instead.
+fn phrase_extents_in(terms: &[String], index: &Index, doc: DocId, out: &mut Vec<Extent>) {
+    if terms.is_empty() {
+        return;
+    }
+
+    let mut offsets = Vec::with_capacity(terms.len());
+    let mut positions: Vec<&[u32]> = Vec::with_capacity(terms.len());
+
+    for (offset, term) in terms.iter().enumerate() {
+        let Some(id) = index.term_id(term) else {
+            return;
+        };
+        let Ok(nth) = index.doc_ids(id).binary_search(&doc) else {
+            return;
+        };
+        let Ok(offset) = u32::try_from(offset) else {
+            return;
+        };
+        offsets.push(offset);
+        positions.push(index.positions(id, nth));
+    }
+
+    let width = u32::try_from(terms.len() - 1).unwrap_or(0);
+    out.extend(aligned_starts(&offsets, &positions).map(|start| Extent {
+        start,
+        end: start.saturating_add(width),
+    }));
 }
 
 /// An upper bound on how many documents `expression` can match.
@@ -676,9 +955,13 @@ fn unsupported(expression: &Expr) -> Option<&'static str> {
 
     expression.walk(&mut |node| {
         let feature = match node {
-            Expr::Near { .. } => Some("the NEAR operator"),
             Expr::Prefix(_) => Some("prefix search"),
-            Expr::Term(_) | Expr::Phrase(_) | Expr::And(..) | Expr::Or(..) | Expr::Not(..) => None,
+            Expr::Term(_)
+            | Expr::Phrase(_)
+            | Expr::Near { .. }
+            | Expr::And(..)
+            | Expr::Or(..)
+            | Expr::Not(..) => None,
         };
 
         // `walk` visits parents before children, so the first hit is the
@@ -1215,29 +1498,165 @@ mod tests {
         );
     }
 
+    /// Parses `query` and evaluates it, so the tests read like queries.
+    fn hits(query: &str, index: &Index) -> Vec<u32> {
+        let expression = crate::query::parse(query).expect("valid query");
+        raw(&evaluate(&expression, index).expect("supported"))
+    }
+
+    #[test]
+    fn near_counts_the_gap_between_the_two_matches() {
+        // alpha 0, beta 1, gamma 2, delta 3, epsilon 4.
+        let index = index_of(&[("", "alpha beta gamma delta epsilon")]);
+
+        let cases = [
+            ("alpha NEAR/1 beta", vec![0]),
+            ("alpha NEAR/1 gamma", vec![]),
+            ("alpha NEAR/2 gamma", vec![0]),
+            ("alpha NEAR/3 epsilon", vec![]),
+            ("alpha NEAR/4 epsilon", vec![0]),
+            // Two bare terms: the gap is just the difference of their
+            // positions, which is the conventional reading of NEAR/k.
+            ("beta NEAR/2 delta", vec![0]),
+            ("beta NEAR/1 delta", vec![]),
+        ];
+
+        for (query, expected) in cases {
+            assert_eq!(hits(query, &index), expected, "{query}");
+        }
+    }
+
+    #[test]
+    fn near_is_symmetric_and_onear_is_not() {
+        let index = index_of(&[("", "alpha beta gamma delta epsilon")]);
+
+        assert_eq!(hits("epsilon NEAR/4 alpha", &index), [0]);
+        assert_eq!(hits("alpha ONEAR/4 epsilon", &index), [0]);
+        assert!(hits("epsilon ONEAR/4 alpha", &index).is_empty());
+        // ONEAR/9 cannot rescue it: the order is wrong, not the distance.
+        assert!(hits("epsilon ONEAR/9 alpha", &index).is_empty());
+    }
+
+    #[test]
+    fn near_one_is_exactly_a_phrase_or_its_reverse() {
+        // The property that makes the chosen definition of `distance` the
+        // right one. If `NEAR/1` were off by one in either direction this
+        // would fail, and so would any user's intuition.
+        let index = index_of(&[
+            ("", "alpha beta gamma"),
+            ("", "beta alpha gamma"),
+            ("", "alpha gamma beta"),
+            ("", "alpha only"),
+        ]);
+
+        assert_eq!(
+            hits("alpha NEAR/1 beta", &index),
+            hits("'alpha beta' OR 'beta alpha'", &index)
+        );
+        assert_eq!(hits("alpha NEAR/1 beta", &index), [0, 1]);
+        // And the ordered form is exactly the phrase.
+        assert_eq!(
+            hits("alpha ONEAR/1 beta", &index),
+            hits("'alpha beta'", &index)
+        );
+    }
+
+    #[test]
+    fn a_term_is_not_near_itself_unless_it_occurs_twice() {
+        let index = index_of(&[("", "alpha beta alpha"), ("", "alpha beta gamma")]);
+
+        // Document 0 has alpha at 0 and 2; document 1 has it once, and must
+        // not match by pairing that occurrence with itself.
+        assert_eq!(hits("alpha NEAR/2 alpha", &index), [0]);
+        assert!(hits("alpha NEAR/1 alpha", &index).is_empty());
+        assert!(hits("gamma NEAR/9 gamma", &index).is_empty());
+    }
+
+    #[test]
+    fn a_phrase_operand_is_measured_from_its_edge() {
+        // machine 0, learning 1, for 2, medical 3, imaging 4.
+        let index = index_of(&[("", "machine learning for medical imaging")]);
+
+        // From the phrase's *end*: 3 - 1 = 2. From its start it would be 3,
+        // and NEAR/2 would wrongly fail.
+        assert_eq!(hits("'machine learning' NEAR/2 medical", &index), [0]);
+        assert!(hits("'machine learning' NEAR/1 medical", &index).is_empty());
+        // Reversed, the gap is measured to the phrase's start.
+        assert_eq!(hits("medical NEAR/2 'machine learning'", &index), [0]);
+    }
+
+    #[test]
+    fn or_inside_near_takes_whichever_side_matched() {
+        let index = index_of(&[("", "alpha beta gamma"), ("", "zeta beta gamma")]);
+
+        assert_eq!(hits("(alpha OR zeta) NEAR/2 gamma", &index), [0, 1]);
+        assert_eq!(hits("(alpha OR flurbles) NEAR/2 gamma", &index), [0]);
+        assert!(hits("(flurbles OR others) NEAR/9 gamma", &index).is_empty());
+    }
+
+    #[test]
+    fn nested_near_measures_from_the_inner_match_span() {
+        // alpha 0, beta 1, gamma 2, delta 3, epsilon 4.
+        let index = index_of(&[("", "alpha beta gamma delta epsilon")]);
+
+        // The inner match spans 0..1, so gamma at 2 is one away.
+        assert_eq!(hits("(alpha NEAR/1 beta) NEAR/1 gamma", &index), [0]);
+        // delta at 3 is two away from the end of that span.
+        assert!(hits("(alpha NEAR/1 beta) NEAR/1 delta", &index).is_empty());
+        assert_eq!(hits("(alpha NEAR/1 beta) NEAR/2 delta", &index), [0]);
+    }
+
+    #[test]
+    fn proximity_does_not_reach_across_the_title_body_join() {
+        // Title ends at position 1; the body starts at 1 + 1 + FIELD_GAP.
+        let index = index_of(&[("alpha beta", "gamma delta")]);
+
+        assert_eq!(hits("alpha NEAR/1 beta", &index), [0]);
+        assert_eq!(hits("gamma NEAR/1 delta", &index), [0]);
+        // The real gap is 101, so anything smaller must not reach.
+        assert!(hits("beta NEAR/50 gamma", &index).is_empty());
+        assert!(hits("beta NEAR/100 gamma", &index).is_empty());
+        // And at exactly 101 it does — which pins FIELD_GAP behaviourally
+        // rather than by reading the constant.
+        assert_eq!(hits("beta NEAR/101 gamma", &index), [0]);
+    }
+
+    #[test]
+    fn proximity_composes_with_the_boolean_operators() {
+        let index = index_of(&[
+            ("", "alpha beta gamma"),
+            ("", "alpha beta delta"),
+            ("", "gamma delta"),
+        ]);
+
+        let cases = [
+            ("(alpha NEAR/1 beta) AND gamma", vec![0]),
+            ("(alpha NEAR/1 beta) NOT gamma", vec![1]),
+            ("(alpha NEAR/1 beta) OR (gamma NEAR/1 delta)", vec![0, 1, 2]),
+            ("alpha AND (beta NEAR/1 gamma)", vec![0]),
+        ];
+
+        for (query, expected) in cases {
+            assert_eq!(hits(query, &index), expected, "{query}");
+        }
+    }
+
+    #[test]
+    fn a_distance_wider_than_the_document_is_still_bounded_by_the_document() {
+        let index = index_of(&[("", "alpha beta"), ("", "alpha"), ("", "beta")]);
+
+        // NEAR cannot reach into another document however large k is.
+        assert_eq!(hits("alpha NEAR/9999 beta", &index), [0]);
+    }
+
     #[test]
     fn later_days_operators_say_so_instead_of_answering_wrongly() {
         let index = index();
 
-        let cases = [
-            (Expr::Prefix("alph".to_owned()), "prefix search"),
-            (
-                Expr::Near {
-                    left: Box::new(term("alpha")),
-                    right: Box::new(term("beta")),
-                    distance: 3,
-                    ordered: false,
-                },
-                "NEAR operator",
-            ),
-        ];
-
-        for (expression, expected) in cases {
-            let message = evaluate(&expression, &index)
-                .expect_err("not implemented until days 9 to 11")
-                .to_string();
-            assert!(message.contains(expected), "{message}");
-        }
+        let message = evaluate(&Expr::Prefix("alph".to_owned()), &index)
+            .expect_err("not implemented until day 11")
+            .to_string();
+        assert!(message.contains("prefix search"), "{message}");
     }
 
     #[test]

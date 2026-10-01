@@ -50,9 +50,14 @@ on the full set.
 | `a ONEAR/3 b` | within 3 positions, `a` first |
 | `comp*` | prefix wildcard |
 
-`AND`, `OR`, `NOT`, grouping, the implicit `AND` and `"exact phrase"` **work
-today**. `NEAR`/`ONEAR` and prefix wildcards parse correctly and report
-`not implemented yet` — days 10 and 11 of the plan fill them in.
+Everything except prefix wildcards **works today**; `comp*` parses correctly and
+reports `not implemented yet` — day 11 of the plan fills it in.
+
+`NEAR` measures the gap between two *matches*, so a phrase operand is measured
+from its nearest edge and `a NEAR/1 b` is exactly `"a b" OR "b a"`. Both
+operands must be able to say where they matched, which `AND` and `NOT` cannot —
+there is no position at which `quantum AND gravity` occurs. `parse` rejects
+`(quantum AND gravity) NEAR/5 loop` and underlines the group at fault.
 
 Operators are **uppercase only**, so `cats and dogs` searches for the word
 "and" rather than silently becoming an operator.
@@ -97,16 +102,15 @@ the planner intersects them, and the hits:
   151,914 document(s), 15.1914% of the corpus, in 17 ms
 ```
 
-A phrase runs in two stages: intersect the words' document lists, then read
-positions only in the documents that survive. Inside a document the check
-anchors on whichever word occurs fewest times there, since content words occur
-once and articles four to eighteen times.
+Phrases and proximity run in two stages: intersect the words' document lists,
+then read positions only in the documents that survive. Inside a document the
+phrase check anchors on whichever word occurs fewest times there.
 
 Intersecting the rarest list first is worth 935× on a three-clause query,
 skipping ahead by exponential search instead of stepping is worth up to 800×
-when one list is far shorter than the other, and anchoring a phrase on its
-rarest word is worth 1.4× on `'the quantum'`. All measured in
-[`docs/RESULTS.md`](docs/RESULTS.md).
+when one list is far shorter than the other, anchoring a phrase on its rarest
+word is worth 1.4× on `'the quantum'`, and widening a `NEAR` window costs
+nothing at all. All measured in [`docs/RESULTS.md`](docs/RESULTS.md).
 
 ## License
 

@@ -19,13 +19,20 @@
 //! with `windows(k)`. It knows nothing of positions, postings or `FIELD_GAP` —
 //! it just looks for the words next to each other, the way a person reading the
 //! document would.
+//!
+//! Proximity needs positions, so day 10 adds a third reference: a
+//! `BTreeMap<String, Vec<u32>>` per document, with the title/body offset
+//! re-derived here rather than imported, and extents computed by nested loops
+//! over every pair. No sorting, no `partition_point`, no early exit, no anchor
+//! heuristic. It is the definition of `NEAR` typed out, and it disagrees with
+//! the engine if the engine is wrong about an edge.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use boolsearch::{
-    DocId, Document, Expr, Index, IndexBuilder, JsonlCorpus, evaluate, parse, tokenize,
+    DocId, Document, Expr, FIELD_GAP, Index, IndexBuilder, JsonlCorpus, evaluate, parse, tokenize,
 };
 use proptest::prelude::*;
 
@@ -97,7 +104,14 @@ fn brute_force(expression: &Expr, fixture: &Fixture) -> BTreeSet<DocId> {
             .difference(&brute_force(right, fixture))
             .copied()
             .collect(),
-        Expr::Near { .. } | Expr::Prefix(_) => unreachable!("days 10 and 11"),
+        Expr::Near { .. } => fixture
+            .positions
+            .iter()
+            .enumerate()
+            .filter(|(_, at)| !brute_extents(expression, at).is_empty())
+            .map(|(nth, _)| DocId::new(u32::try_from(nth).expect("small fixture")))
+            .collect(),
+        Expr::Prefix(_) => unreachable!("day 11"),
     }
 }
 
@@ -142,10 +156,123 @@ fn brute_force_phrase(phrase: &[String], words: &Words) -> BTreeSet<DocId> {
         .collect()
 }
 
+/// Where every term occurs in one document, ascending.
+type DocPositions = BTreeMap<String, Vec<u32>>;
+
+/// Positions per document, with the field offset worked out from scratch.
+///
+/// Deliberately re-derives `FIELD_GAP` arithmetic instead of calling the
+/// index's own helper. If both used the same function, agreeing about the
+/// title/body join would prove nothing about it.
+fn positions_of(documents: &[Document]) -> Vec<DocPositions> {
+    documents
+        .iter()
+        .map(|document| {
+            let mut at: DocPositions = BTreeMap::new();
+            let mut after_title = 0;
+
+            for token in tokenize(&document.title) {
+                at.entry(token.normalized().into_owned())
+                    .or_default()
+                    .push(token.position);
+                after_title = token.position + 1;
+            }
+
+            let offset = after_title + FIELD_GAP;
+            for token in tokenize(&document.body) {
+                at.entry(token.normalized().into_owned())
+                    .or_default()
+                    .push(token.position + offset);
+            }
+
+            at
+        })
+        .collect()
+}
+
+/// The extents at which `expression` matches in one document, the slow way.
+///
+/// Every case is the definition written out: a phrase tries every position of
+/// its first word, a `NEAR` tries every pair of extents. Quadratic and
+/// allocating, over twenty documents, and incapable of an off-by-one in a
+/// window bound because there are no window bounds.
+fn brute_extents(expression: &Expr, at: &DocPositions) -> Vec<(u32, u32)> {
+    let mut extents = match expression {
+        Expr::Term(term) => at
+            .get(term)
+            .map(|positions| positions.iter().map(|&p| (p, p)).collect())
+            .unwrap_or_default(),
+
+        Expr::Phrase(terms) => {
+            let Some(first) = terms.first().and_then(|term| at.get(term)) else {
+                return Vec::new();
+            };
+            let width = u32::try_from(terms.len() - 1).expect("short phrase");
+
+            first
+                .iter()
+                .filter(|&&start| {
+                    terms.iter().enumerate().all(|(offset, term)| {
+                        let offset = u32::try_from(offset).expect("short phrase");
+                        at.get(term)
+                            .is_some_and(|positions| positions.contains(&(start + offset)))
+                    })
+                })
+                .map(|&start| (start, start + width))
+                .collect()
+        }
+
+        Expr::Or(left, right) => {
+            let mut both = brute_extents(left, at);
+            both.extend(brute_extents(right, at));
+            both
+        }
+
+        Expr::Near {
+            left,
+            right,
+            distance,
+            ordered,
+        } => {
+            let first = brute_extents(left, at);
+            let second = brute_extents(right, at);
+            let mut paired = Vec::new();
+
+            for &(a_start, a_end) in &first {
+                for &(b_start, b_end) in &second {
+                    if b_start > a_end && b_start - a_end <= *distance {
+                        paired.push((a_start, b_end));
+                    }
+                }
+            }
+            if !*ordered {
+                for &(b_start, b_end) in &second {
+                    for &(a_start, a_end) in &first {
+                        if a_start > b_end && a_start - b_end <= *distance {
+                            paired.push((b_start, a_end));
+                        }
+                    }
+                }
+            }
+
+            paired
+        }
+
+        Expr::And(..) | Expr::Not(..) | Expr::Prefix(_) => {
+            unreachable!("not positional, or day 11")
+        }
+    };
+
+    extents.sort_unstable();
+    extents.dedup();
+    extents
+}
+
 struct Fixture {
     index: Index,
     reference: Reference,
     words: Words,
+    positions: Vec<DocPositions>,
     vocabulary: Vec<String>,
     /// Word sequences that really occur in the fixture, 2 to 5 words long.
     ///
@@ -190,6 +317,7 @@ static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
         index: index_of(&documents),
         reference,
         words,
+        positions: positions_of(&documents),
         vocabulary,
         ngrams,
     }
@@ -372,6 +500,140 @@ fn a_phrase_never_spans_the_title_body_join() {
     assert!(checked >= 15, "only checked {checked} documents");
 }
 
+#[test]
+fn the_day_ten_acceptance_queries_return_the_right_documents() {
+    for query in [
+        "quantum NEAR/3 error",
+        "quantum NEAR/1 error",
+        "quantum ONEAR/3 error",
+        "error ONEAR/3 quantum",
+        "'error correction' NEAR/5 surface",
+        "surface NEAR/5 'error correction'",
+        "(quantum OR optical) NEAR/4 code",
+        "(quantum NEAR/2 error) NEAR/4 threshold",
+        "quantum NEAR/9999 trees",
+        "quantum NEAR/3 flurbles",
+        "quantum AND (surface NEAR/6 code) NOT classical",
+    ] {
+        agree(&parse(query).expect("valid query"));
+    }
+
+    let hits = |query: &str| {
+        evaluate(&parse(query).expect("valid query"), &FIXTURE.index).expect("supported")
+    };
+    assert!(!hits("quantum NEAR/3 error").is_empty());
+    assert!(hits("quantum NEAR/3 flurbles").is_empty());
+}
+
+#[test]
+fn near_one_is_the_phrase_in_either_order() {
+    // Checked against the engine's *own* phrase search rather than the
+    // reference, because the point is the relationship between two operators,
+    // not whether either is right.
+    for (left, right) in [
+        ("quantum", "error"),
+        ("error", "correction"),
+        ("surface", "code"),
+        ("the", "quantum"),
+    ] {
+        let near = evaluate(
+            &parse(&format!("{left} NEAR/1 {right}")).expect("valid"),
+            &FIXTURE.index,
+        )
+        .expect("supported");
+        let phrases = evaluate(
+            &parse(&format!("'{left} {right}' OR '{right} {left}'")).expect("valid"),
+            &FIXTURE.index,
+        )
+        .expect("supported");
+
+        assert_eq!(near, phrases, "{left} NEAR/1 {right}");
+
+        let ordered = evaluate(
+            &parse(&format!("{left} ONEAR/1 {right}")).expect("valid"),
+            &FIXTURE.index,
+        )
+        .expect("supported");
+        let phrase = evaluate(
+            &parse(&format!("'{left} {right}'")).expect("valid"),
+            &FIXTURE.index,
+        )
+        .expect("supported");
+
+        assert_eq!(ordered, phrase, "{left} ONEAR/1 {right}");
+    }
+}
+
+#[test]
+fn widening_the_distance_can_only_add_documents() {
+    // Monotonicity. Cheap to check, and it would catch a window bound that
+    // was right at k=3 and wrong at k=4.
+    for (left, right) in [("quantum", "error"), ("surface", "threshold")] {
+        let mut previous = Vec::new();
+
+        for distance in 1..=12 {
+            let found = evaluate(
+                &parse(&format!("{left} NEAR/{distance} {right}")).expect("valid"),
+                &FIXTURE.index,
+            )
+            .expect("supported");
+
+            assert!(
+                previous.iter().all(|doc| found.contains(doc)),
+                "{left} NEAR/{distance} {right} lost a document the narrower query found"
+            );
+            previous = found;
+        }
+    }
+}
+
+#[test]
+fn an_ordered_match_is_always_also_an_unordered_one() {
+    for query in [
+        ("quantum", "error", 4),
+        ("error", "correction", 2),
+        ("the", "surface", 6),
+    ] {
+        let (left, right, distance) = query;
+        let ordered = evaluate(
+            &parse(&format!("{left} ONEAR/{distance} {right}")).expect("valid"),
+            &FIXTURE.index,
+        )
+        .expect("supported");
+        let unordered = evaluate(
+            &parse(&format!("{left} NEAR/{distance} {right}")).expect("valid"),
+            &FIXTURE.index,
+        )
+        .expect("supported");
+
+        assert!(
+            ordered.iter().all(|doc| unordered.contains(doc)),
+            "{left}/{right}"
+        );
+    }
+}
+
+#[test]
+fn the_two_phrase_references_agree_with_each_other() {
+    // One scans a flat word list with `windows`; the other works from a
+    // position map. Both are independent of the engine, and if they disagreed
+    // the proptests below would be checking against a coin flip.
+    for ngram in FIXTURE.ngrams.iter().take(400) {
+        let expression = Expr::Phrase(ngram.clone());
+
+        let windowed = brute_force_phrase(ngram, &FIXTURE.words);
+        let positional: BTreeSet<DocId> = FIXTURE
+            .positions
+            .iter()
+            .enumerate()
+            .filter(|(_, at)| !brute_extents(&expression, at).is_empty())
+            .map(|(nth, _)| DocId::new(u32::try_from(nth).expect("small fixture")))
+            .collect();
+
+        assert_eq!(windowed, positional, "{expression}");
+    }
+}
+
 /// A random query tree over terms the fixture actually contains.
 ///
 /// Drawing from the real vocabulary rather than random strings is the point:
@@ -381,8 +643,9 @@ fn any_expression() -> impl Strategy<Value = Expr> {
     let terms = FIXTURE.vocabulary.clone();
 
     prop_oneof![
-        3 => prop::sample::select(terms).prop_map(Expr::Term),
+        4 => prop::sample::select(terms).prop_map(Expr::Term),
         2 => any_phrase(),
+        2 => any_near(),
     ]
     .prop_recursive(4, 24, 2, |inner| {
         prop_oneof![
@@ -394,6 +657,46 @@ fn any_expression() -> impl Strategy<Value = Expr> {
                 .prop_map(|(left, right)| Expr::Not(Box::new(left), Box::new(right))),
         ]
     })
+}
+
+/// A random positional expression: anything `NEAR` is allowed to take.
+///
+/// Terms, phrases, `OR` of those, and nested `NEAR` — the set `is_positional`
+/// admits. `AND` and `NOT` are deliberately absent, because the parser rejects
+/// them here and the generator should not be testing a path that cannot exist.
+fn any_positional() -> impl Strategy<Value = Expr> {
+    let terms = FIXTURE.vocabulary.clone();
+
+    prop_oneof![
+        3 => prop::sample::select(terms).prop_map(Expr::Term),
+        2 => any_phrase(),
+    ]
+    .prop_recursive(2, 6, 2, |inner| {
+        prop_oneof![
+            (inner.clone(), inner.clone())
+                .prop_map(|(left, right)| Expr::Or(Box::new(left), Box::new(right))),
+            (inner.clone(), inner, 1_u32..=8, any::<bool>()).prop_map(
+                |(left, right, distance, ordered)| Expr::Near {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    distance,
+                    ordered,
+                }
+            ),
+        ]
+    })
+}
+
+/// A random `NEAR` over two positional operands.
+fn any_near() -> impl Strategy<Value = Expr> {
+    (any_positional(), any_positional(), 1_u32..=8, any::<bool>()).prop_map(
+        |(left, right, distance, ordered)| Expr::Near {
+            left: Box::new(left),
+            right: Box::new(right),
+            distance,
+            ordered,
+        },
+    )
 }
 
 /// A random phrase, half of them real and half of them made up.
@@ -447,6 +750,28 @@ proptest! {
         let expected: Vec<DocId> = brute_force(&expression, &FIXTURE).into_iter().collect();
 
         prop_assert_eq!(&found, &expected, "{}", expression);
+    }
+
+    /// Proximity specifically, against the nested-loop reference.
+    ///
+    /// The generator nests `NEAR` inside `NEAR` and puts phrases and `OR` on
+    /// either side, which is where the extent arithmetic can go wrong in ways
+    /// no hand-written case would reach: an inner match whose span is wider
+    /// than either operand, two candidate extents whose nearest pair is not
+    /// the first pair, a phrase whose own occurrences overlap.
+    #[test]
+    fn any_proximity_query_agrees_with_a_nested_loop_reference(expression in any_near()) {
+        let found = evaluate(&expression, &FIXTURE.index).expect("proximity works");
+        let expected: Vec<DocId> = brute_force(&expression, &FIXTURE).into_iter().collect();
+
+        prop_assert_eq!(&found, &expected, "{}", expression);
+    }
+
+    /// Everything the parser accepts as a `NEAR` operand, it must evaluate.
+    #[test]
+    fn every_positional_expression_is_evaluable(expression in any_positional()) {
+        prop_assert!(expression.is_positional(), "{}", expression);
+        prop_assert!(evaluate(&expression, &FIXTURE.index).is_ok(), "{}", expression);
     }
 
     /// Re-parsing a printed tree must evaluate identically.
