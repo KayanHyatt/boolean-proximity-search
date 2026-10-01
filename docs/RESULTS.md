@@ -766,3 +766,46 @@ tests were checking against a coin flip.
 The `FIELD_GAP` test is behavioural rather than a constant read: with a
 two-word title, `beta NEAR/100 gamma` must find nothing and `beta NEAR/101
 gamma` must find the document. That pins the gap's value from the outside.
+
+### Day 10 addendum — real corpus, real hardware
+
+Kayan's laptop, 500,000 arXiv records.
+
+| Query | Hits | Latency |
+| --- | --- | --- |
+| `quantum NEAR/1 error` | 436 | **750 µs** |
+| `'quantum error' OR 'error quantum'` | 436 | **897 µs** |
+| `'error correction' NEAR/5 surface` | 14 | **297 µs** |
+
+**The equivalence holds on real data.** 436 documents both ways, and `NEAR/1`
+is 1.2× faster than the two-phrase form it is equal to.
+
+**And one claim above is backwards.** The synthetic measurement said a phrase
+operand costs twice a term operand. On the real corpus
+`'error correction' NEAR/5 surface` runs in 297 µs while `quantum NEAR/1 error`
+takes 750 µs — the phrase operand is 2.5× *cheaper*.
+
+Both numbers are right; the synthetic one was answering a different question.
+Per surviving document a phrase operand does cost more, because inside a `NEAR`
+it pays a binary search per word instead of carrying a cursor. But a phrase is
+far more selective than any of its words: `"error correction"` bounds stage one
+at 5,458 documents where the bare term `error` bounds it at 11,793, and in real
+arXiv the phrase itself matches only 674. Selectivity wins by more than the
+per-document cost loses, and the synthetic corpus could not show it because its
+planted phrases were nearly as common as their words.
+
+The cheap generalisation — "phrase operands are slower" — survives one corpus
+and not two. The durable statement is narrower: *stage one decides the cost of
+a proximity query, and anything that narrows it pays for itself.*
+
+### A note on result quality
+
+`'error correction' NEAR/5 surface` returns 14 documents from 500,000. Reading
+the titles: *Error Correction and Degeneracy in Surface Codes*, *Surface code
+quantum error correction incorporating accurate error propagation*, *High
+threshold error correction for the surface code*, *Subsystem surface codes with
+three-qubit check operators*, *Checking the error correction strength of
+arbitrary surface codes*. No ranking, no scoring, no relevance model — just a
+Boolean question answered exactly. That is the argument for this kind of engine:
+when the user can say precisely what they mean, they do not need to be guessed
+at.
